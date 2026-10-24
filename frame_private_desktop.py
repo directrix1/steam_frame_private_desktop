@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Steam Frame: terminal-managed gocryptfs private home and (Private) KDE launchers.
 
-Run: unlocks after password entry, creates launchers; Ctrl+C/SIGTERM exits,
-terminates private apps, unmounts and removes launchers. A same-file watchdog
-attempts cleanup after SIGKILL/crash. Preserves v13's encrypted vault.
+Install once:  ./frame_private_desktop.py --install-launcher
+Run from the Frame '+' menu as "Private Desktop", or run the script in Konsole.
+Unlocking applies --resolution 1920x1080 to the desktop by default; use
+--resolution keep to leave it. Ctrl+C/SIGTERM exits, terminates private apps,
+unmounts and removes launchers. A same-file watchdog attempts cleanup after
+SIGKILL/crash. Preserves the encrypted vault. --remove-launcher undoes install.
 
 Security: encryption at rest only. Your normal login user can access the
 plaintext FUSE mount while open, and the host services are shared. Single-
@@ -50,6 +53,10 @@ GUIX_HELPER = Path('/run/setuid-programs/fusermount3')
 PREFIX = 'frame-private-app-'
 GUIX_ENV = HOME / '.local/bin/guix-env'
 SETUP_LOG = STATE / 'dependency-install.log'
+DESKTOP_ID = 'frame-private-desktop.desktop'
+MENU_ENTRY = LAUNCH_DIR / DESKTOP_ID
+MENU_WRAPPER = HOME / '.local/bin/frame-private-desktop-launch'
+DEFAULT_RESOLUTION = '1920x1080'
 os.umask(0o077)
 
 
@@ -415,7 +422,7 @@ def scan_launchers():
         if not folder.is_dir():
             continue
         for path in sorted(folder.rglob('*.desktop')):
-            if path.name.startswith(PREFIX) or path.name == 'frame-private-desktop.desktop':
+            if path.name.startswith(PREFIX) or path.name == DESKTOP_ID:
                 continue
             d = read_desktop(path)
             if not d or is_parent_flatpak_entry(path, d):
@@ -483,6 +490,47 @@ def update_kde_cache():
     if command:
         subprocess.Popen([command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def menu_entry_text():
+    # The Frame '+' menu / Add-Library-Shortcut scanner wants: absolute Exec,
+    # no spaces in the Exec line, Type=Application, no NoDisplay, no
+    # Categories=Settings. The generated wrapper keeps the Exec to one token.
+    return ('[Desktop Entry]\n'
+            'Type=Application\n'
+            'Version=1.0\n'
+            'Name=Private Desktop\n'
+            'GenericName=Encrypted desktop\n'
+            'Comment=gocryptfs encrypted home with (Private) app launchers\n'
+            f'Exec={MENU_WRAPPER}\n'
+            'Icon=dialog-password\n'
+            'Terminal=false\n'
+            'Categories=Utility;System;\n'
+            'StartupNotify=false\n')
+
+
+def install_menu_entry():
+    terminal = shutil.which('konsole') or shutil.which('xterm')
+    if not terminal:
+        raise PrivateError('Konsole not found; install it or run the script from a terminal yourself')
+    script = Path(__file__).resolve()
+    MENU_WRAPPER.parent.mkdir(parents=True, exist_ok=True)
+    wrapper = ('#!/bin/sh\n'
+               '# Opens the Frame Private Desktop controller in a Konsole window.\n'
+               f'exec {shlex.quote(terminal)} -e {shlex.quote(str(script))}\n')
+    atomic_write(MENU_WRAPPER, wrapper, 0o755)
+    atomic_write(MENU_ENTRY, menu_entry_text(), 0o755)
+    update_kde_cache()
+    info(f'Installed menu launcher: {MENU_ENTRY} (Exec wrapper: {MENU_WRAPPER})')
+    info('On the Frame: press + and pick "Private Desktop". If it is missing there, '
+         'copy the .desktop file into ~/Desktop as well.')
+
+
+def remove_menu_entry():
+    MENU_ENTRY.unlink(missing_ok=True)
+    MENU_WRAPPER.unlink(missing_ok=True)
+    update_kde_cache()
+    info('Removed the "Private Desktop" menu entry and its wrapper.')
 
 
 def make_launchers(script):
@@ -959,11 +1007,83 @@ def setup_dependencies():
     ensure_fuse_helper()
 
 
+def parse_resolution(spec):
+    spec = (spec or '').strip().lower()
+    if spec in ('', 'keep', 'none', 'off', 'native'):
+        return None
+    match = re.fullmatch(r'(\d{2,5})x(\d{2,5})', spec)
+    if not match:
+        raise PrivateError('--resolution expects WxH like 1920x1080, or "keep"')
+    return int(match.group(1)), int(match.group(2))
+
+
+def _active_mode_is(ksd, width, height):
+    try:
+        listing = subprocess.run([ksd, '-o'], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+    if re.search(rf'{width}x{height}@[\d.]+\*', listing):
+        return f'{width}x{height}'
+    if listing:
+        current = re.findall(r'(\d{2,5}x\d{2,5})@[\d.]+\*', listing)
+        if current:
+            return current[0]
+    return ''
+
+
+def apply_resolution(width, height):
+    """Best-effort resize of the nested Plasma output via KScreen (kscreen-doctor).
+
+    This changes the resolution of the desktop UI that the Frame shows on its
+    virtual screen. Never fatal: a session KScreen cannot resize keeps its
+    current mode and the private desktop still works.
+    """
+    ksd = shutil.which('kscreen-doctor')
+    if not ksd:
+        info('Resolution: kscreen-doctor not found; keeping the current desktop resolution.')
+        return
+    current = _active_mode_is(ksd, width, height)
+    if current == f'{width}x{height}':
+        info(f'Desktop already at {width}x{height}.')
+        return
+    try:
+        listing = subprocess.run([ksd, '-o'], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        listing = ''
+    outputs = sorted(set(re.findall(r'(?<![A-Za-z0-9])([A-Za-z]+-[A-Za-z0-9.]+)(?![\w-])', listing)))
+    scopes = ['all'] + outputs[:6]
+    target = f'{width}x{height}'
+    for scope in scopes:
+        for mode in (target, f'{target}@60', f'{target}@60.00'):
+            try:
+                r = subprocess.run([ksd, f'output.{scope}.mode.{mode}'],
+                                   stdin=subprocess.DEVNULL, capture_output=True,
+                                   text=True, timeout=20)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if r.returncode == 0 and _active_mode_is(ksd, width, height) == target:
+                info(f'Desktop resolution set to {target} (output {scope}).')
+                return
+    info(f'Could not switch the desktop to {target} (currently {current or "unknown"}); '
+         'keeping the existing resolution. Try again, use --resolution WxH, '
+         'or run kscreen-doctor manually in Konsole.')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--launch', nargs='+', metavar='ID_OR_URI',
                         help=argparse.SUPPRESS)
     parser.add_argument('--watchdog', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--resolution', default=os.environ.get('FRAME_PRIVATE_RESOLUTION',
+                                                               DEFAULT_RESOLUTION),
+                        metavar='WxH', help='Desktop resolution applied on unlock '
+                        f'(default: {DEFAULT_RESOLUTION}; "keep" leaves it untouched)')
+    parser.add_argument('--install-launcher', action='store_true',
+                        help='Install the Frame "+" menu entry (Konsole wrapper + .desktop) and exit')
+    parser.add_argument('--remove-launcher', action='store_true',
+                        help='Remove the installed Frame "+" menu entry and exit')
     args = parser.parse_args()
     os.umask(0o077)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -974,6 +1094,13 @@ def main():
         return 0
     if args.watchdog is not None:
         return watchdog_main(args.watchdog)
+    if args.install_launcher:
+        install_menu_entry()
+        return 0
+    if args.remove_launcher:
+        remove_menu_entry()
+        return 0
+    resolution = parse_resolution(args.resolution)
     if not sys.stdin.isatty():
         raise PrivateError('Start this controller from a real terminal (Konsole).')
     script = Path(__file__).resolve()
@@ -1004,6 +1131,13 @@ def main():
             app.fuse = unlock_home()
             atomic_write(FUSE_PID, json.dumps({'pid': app.fuse.pid,
                                                'start': start_ticks(app.fuse.pid)}), 0o600)
+            if resolution:
+                # Runs in the host Plasma session (needs its D-Bus), never inside the
+                # app sandbox; a failure here must not abort the unlock.
+                try:
+                    apply_resolution(*resolution)
+                except Exception as e:
+                    info('Resolution adjustment failed: ' + str(e))
             app.start_server()
             count = make_launchers(script)
             info(f'Unlocked; {count} (Private) launchers are available in your KDE menu.')
