@@ -394,9 +394,9 @@ def paste(display):
         report_error(display, 'read', type(exc).__name__)
         return None
     if result.returncode != 0:
-        # Empty/non-text selections are not fatal, but protocol errors are.
+        # An empty clipboard is routine, not an error; protocol errors are.
         error = result.stderr.decode('utf-8', errors='replace').strip()[:180]
-        if error:
+        if error and 'Nothing is copied' not in error:
             report_error(display, 'read', error)
         return None
     if len(result.stdout) > MAX_BYTES:
@@ -404,19 +404,33 @@ def paste(display):
         return None
     return result.stdout
 
+holders = []
+
 def copy(display, data):
+    # wl-copy forks a daemon to OWN the selection until the next copy replaces
+    # it. That daemon keeps our stderr pipe open, so waiting for EOF (as
+    # subprocess.run does) times out and its kill then destroys a perfectly
+    # successful copy -- which previously looked like "write failed" and made
+    # the mirror loop retry every cycle. Still-running after we fed the data
+    # therefore means success: the daemon holds the selection.
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [str(BIN / 'wl-copy'), '--type', 'text/plain;charset=utf-8'],
             input=data, env=env_for(display), stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE, timeout=3,
+            stderr=subprocess.PIPE,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         report_error(display, 'write', type(exc).__name__)
         return False
-    if result.returncode != 0:
-        error = result.stderr.decode('utf-8', errors='replace').strip()[:180]
-        report_error(display, 'write', error or f'exit code {result.returncode}')
+    holders[:] = [h for h in holders if h.poll() is None]  # reap finished daemons
+    try:
+        _, stderr = proc.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        holders.append(proc)  # detached on purpose: it owns the clipboard now
+        return True
+    if proc.returncode != 0:
+        error = stderr.decode('utf-8', errors='replace').strip()[:180]
+        report_error(display, 'write', error or f'exit code {proc.returncode}')
         return False
     return True
 
@@ -425,11 +439,14 @@ while not (RUNTIME / INNER).is_socket():
     time.sleep(.25)
 
 previous = {OUTER: paste(OUTER), INNER: paste(INNER)}
+# Content we ourselves last wrote into each side; never bounce it back.
+last_written = {OUTER: None, INNER: None}
 log('both Wayland sockets available; monitoring bidirectionally')
 # Make it possible to copy from the host *before* entering private KDE.
 if previous[OUTER] is not None and previous[OUTER] != previous[INNER]:
     if copy(INNER, previous[OUTER]):
         previous[INNER] = previous[OUTER]
+        last_written[INNER] = previous[OUTER]
         log('initial parent -> private clipboard synchronized')
 
 while (RUNTIME / INNER).is_socket():
@@ -439,8 +456,11 @@ while (RUNTIME / INNER).is_socket():
     if changed_outer or changed_inner:
         # If changes coincide, prefer the private selection.
         source, dest = (INNER, OUTER) if changed_inner else (OUTER, INNER)
-        if sampled[source] != sampled[dest] and copy(dest, sampled[source]):
+        if (sampled[source] != sampled[dest]
+                and sampled[source] != last_written[dest]
+                and copy(dest, sampled[source])):
             sampled[dest] = sampled[source]
+            last_written[dest] = sampled[source]
             log(f'{STATES[source]} -> {STATES[dest]} clipboard synchronized')
     previous = sampled
     time.sleep(.35)
@@ -737,7 +757,7 @@ def menu_entry_text() -> str:
             "StartupNotify=false\n")
 
 
-def install_menu_entry(share_clipboard: bool) -> None:
+def install_menu_entry(share_clipboard: bool | None) -> None:
     script = Path(__file__).resolve()
     if any(ch in str(script) for ch in ('"', '\n', '\r', '\\')):
         raise LaunchError("Script pathname is not safe to embed in the launcher wrapper")
@@ -746,7 +766,7 @@ def install_menu_entry(share_clipboard: bool) -> None:
         raise LaunchError("Konsole not found; install it or run this script from a terminal yourself")
     python3 = shutil.which("python3") or "/usr/bin/python3"
     MENU_WRAPPER.parent.mkdir(parents=True, exist_ok=True)
-    flags = "" if share_clipboard else " --no-share-clipboard"
+    flags = {None: "", True: " --share-clipboard", False: " --no-share-clipboard"}[share_clipboard]
     # All output (ours plus the nested session's inherited stdout/stderr) is
     # teed to LAUNCH_LOG so a failed launch leaves a readable trail. bash is
     # used for PIPESTATUS so the log records the script's own exit code, not
@@ -796,8 +816,9 @@ def main() -> int:
     parser.add_argument("--remove-launcher", action="store_true",
                         help="Remove the installed Frame '+' menu entry and exit")
     clipboard = parser.add_mutually_exclusive_group()
-    clipboard.add_argument("--share-clipboard", dest="share_clipboard", action="store_true", default=True,
-                           help="Enable bidirectional TEXT clipboard sync (the default)")
+    clipboard.add_argument("--share-clipboard", dest="share_clipboard", action="store_true", default=None,
+                           help="Enable bidirectional TEXT clipboard sync (default when running "
+                                "inside the KDE desktop; off by default from the '+' menu)")
     clipboard.add_argument("--no-share-clipboard", dest="share_clipboard", action="store_false",
                            help="Disable clipboard sharing to keep private clipboard data off the host")
     parser.add_argument("--reset-empty-vault", action="store_true",
@@ -824,6 +845,16 @@ def main() -> int:
         return 0
     if not sys.stdin.isatty():
         raise LaunchError("Launch from a terminal so the passphrase can be entered securely")
+
+    # A '+'-menu launch has no WAYLAND_DISPLAY: its parent is gamescope's
+    # Steam session, not the KDE desktop the bridge would sync with. Default
+    # clipboard sharing OFF there; explicit --share-clipboard still enables it.
+    menu_launch = not os.environ.get("WAYLAND_DISPLAY", "")
+    if args.share_clipboard is None:
+        args.share_clipboard = not menu_launch
+        if not args.share_clipboard:
+            info("Launched from the '+' menu: clipboard sharing is off by default. "
+                 "Pass --share-clipboard to bridge with the desktop session anyway.")
 
     runtime_base, wayland_socket = find_outer_wayland()
     state = home / REL_STATE

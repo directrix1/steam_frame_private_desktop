@@ -26,7 +26,10 @@ session ends, the vault unmounts and nothing plaintext is left on disk.
   remote) lives encrypted in the vault.
 - **Clipboard** — bidirectional *text* clipboard sync between host and private
   desktop using `wl-clipboard` ≥ 2.3 (SteamOS's copy is used when new enough,
-  otherwise Guix's). Disable with `--no-share-clipboard`.
+  otherwise Guix's). Default is context-aware: **on** when launched from a
+  terminal inside the desktop, **off** when launched from the `+` menu (where
+  the outer session is Steam, not a desktop worth trading clipboard with).
+  Override either way with `--share-clipboard` / `--no-share-clipboard`.
 - **Lock** — `Ctrl+C` in the Konsole window stops the session, unmounts via
   `fusermount3 -u` (with retries), and refuses to pretend success if anything
   still holds the mount. `SIGTERM` is treated the same way.
@@ -71,8 +74,10 @@ cd steam_frame_private_desktop
 | `~/.local/share/applications/frame-private-desktop.desktop` | The `Private Desktop` entry for the Frame `+` menu / "Add Library Shortcut" |
 
 The `Exec` line is a single space-free absolute path, as the SteamOS non-Steam
-scanner requires. Add `--no-share-clipboard` at install time to bake clipboard
-sharing off into the wrapper. Undo anytime with
+scanner requires. Clipboard sharing then follows the context-aware default at
+launch time (on in-desktop, off from the menu); pass `--share-clipboard` or
+`--no-share-clipboard` alongside `--install-launcher` to bake an explicit
+choice into the wrapper instead. Undo anytime with
 `./frame_private_desktop.py --remove-launcher` (`--make-launcher` is accepted
 as a legacy alias for `--install-launcher`).
 
@@ -106,8 +111,9 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
 --width W / --height H        Nested display size (default 1920x1080)
 --install-launcher            Install the Frame '+' menu entry and exit
 --remove-launcher             Remove it and exit
---share-clipboard             Bidirectional text clipboard sync (default)
---no-share-clipboard          Keep private clipboard data off the host
+--share-clipboard             Force clipboard sync on (desktop default: on)
+--no-share-clipboard          Off (the '+'-menu default; the outer session there
+                              is Steam, so the bridge is usually pointless)
 --reset-empty-vault           Archive and reinitialize a vault that contains
                               nothing but its config (refuses if it has data)
 ```
