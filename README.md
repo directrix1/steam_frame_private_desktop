@@ -141,11 +141,16 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
 | `~/.local/share/frame-private-desktop/encrypted/` | gocryptfs vault (ciphertext) |
 | `~/.local/share/frame-private-desktop/mount/` | plaintext mount (only while unlocked) |
 | `~/.local/share/frame-private-desktop/session.lock` | single-instance `flock` |
+| `~/.local/share/frame-private-desktop/launch.log` | every `+`-menu launch: full output of the controller *and* the nested Plasma session, with exit codes |
 | `~/.local/share/frame-private-desktop/bin/` | in-vault startup shim (`private-plasma-start`, kwin wrappers, clipboard bridge) |
 | `~/.local/bin/gocryptfs-native` | Guix `gocryptfs` ELF run via `/lib/ld-linux-aarch64.so.1` |
 
 ## Troubleshooting
 
+- **Vault unlocks but no desktop appears (or anything from a `+`-menu launch)**
+  — read `~/.local/share/frame-private-desktop/launch.log`: every menu launch
+  appends the controller's *and* the nested Plasma session's complete output
+  plus the exit code.
 - **"WAYLAND_DISPLAY isn't set" from the `+` menu** — fixed: the `+` menu
   launches Konsole from gamescope's outer session, which has no Wayland
   display; the script now auto-discovers the running nested Plasma compositor

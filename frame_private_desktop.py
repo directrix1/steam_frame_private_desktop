@@ -55,6 +55,7 @@ GUIX_HELPER = Path("/run/setuid-programs/fusermount3")
 DESKTOP_ID = "frame-private-desktop.desktop"
 MENU_ENTRY = Path.home() / ".local/share/applications" / DESKTOP_ID
 MENU_WRAPPER = Path.home() / ".local/bin/frame-private-desktop-launch"
+LAUNCH_LOG = Path.home() / REL_STATE / "launch.log"
 
 
 class LaunchError(Exception):
@@ -721,12 +722,27 @@ def install_menu_entry(share_clipboard: bool) -> None:
     python3 = shutil.which("python3") or "/usr/bin/python3"
     MENU_WRAPPER.parent.mkdir(parents=True, exist_ok=True)
     flags = "" if share_clipboard else " --no-share-clipboard"
+    # All output (ours plus the nested session's inherited stdout/stderr) is
+    # teed to LAUNCH_LOG so a failed launch leaves a readable trail. bash is
+    # used for PIPESTATUS so the log records the script's own exit code, not
+    # tee's. The interactive sudo/gocryptfs prompts are unaffected: they read
+    # the Konsole TTY directly; only the visible echo flows through tee.
+    q = shlex.quote
+    log = q(str(LAUNCH_LOG))
+    runner = shutil.which("bash") or shutil.which("sh")
+    collect = f"code=\"${{PIPESTATUS[0]}}\"; " if runner.endswith("bash") else "code=$?; "
+    inner = (f"{q(python3)} {q(str(script))}{flags} 2>&1 | tee -a {log}; "
+             f"{collect}printf '=== session ended rc=%s ===\\n' \"$code\" >> {log}; "
+             'exit "$code"')
     wrapper = ("#!/bin/sh\n"
                "# Opens the Frame private KDE desktop controller in a Konsole window.\n"
-               "# --hold keeps the window open after the command exits so passphrase\n"
-               "# prompts, sudo errors, and unmount warnings remain readable.\n"
-               f"exec {shlex.quote(terminal)} --hold -e {shlex.quote(python3)} "
-               f"{shlex.quote(str(script))}{flags}\n")
+               "# --hold keeps the window open after the command exits so prompts and\n"
+               "# errors stay readable; ALL output is also appended to launch.log:\n"
+               "#   ~/.local/share/frame-private-desktop/launch.log\n"
+               f"LOG={q(str(LAUNCH_LOG))}\n"
+               'mkdir -p "${LOG%/*}" 2>/dev/null\n'
+               "printf '\\n=== %s Private Desktop launch (pid %s) ===\\n' \"$(date -Is)\" \"$$\" >> \"$LOG\"\n"
+               f"exec {q(terminal)} --hold -e {q(runner)} -c {q(inner)}\n")
     MENU_WRAPPER.write_text(wrapper, encoding="utf-8")
     MENU_WRAPPER.chmod(0o755)
     MENU_ENTRY.parent.mkdir(parents=True, exist_ok=True)
