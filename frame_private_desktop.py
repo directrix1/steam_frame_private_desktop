@@ -178,15 +178,27 @@ def find_outer_wayland() -> tuple[Path, Path]:
         )
 
     display = os.environ.get("WAYLAND_DISPLAY", "")
-    if not display:
-        raise LaunchError(
-            "WAYLAND_DISPLAY isn't set. Launch from Konsole inside Steam Frame's "
-            "Desktop panel, not from a plain SSH shell."
-        )
-    socket = Path(display) if display.startswith("/") else runtime / display
-    if not socket.is_socket() or not socket.resolve().is_relative_to(base.resolve()):
-        raise LaunchError(f"Host Wayland socket isn't accessible under {base}: {socket}")
-    return base, socket
+    if display:
+        socket = Path(display) if display.startswith("/") else runtime / display
+        if not socket.is_socket() or not socket.resolve().is_relative_to(base.resolve()):
+            raise LaunchError(f"Host Wayland socket isn't accessible under {base}: {socket}")
+        return base, socket
+    # A '+'-menu launch starts Konsole from gamescope's outer session, which
+    # has no WAYLAND_DISPLAY at all. Discover the running nested Plasma
+    # compositor instead of failing; find_outer_wayland's existing checks
+    # (socket type, ownership, under the user runtime) still apply.
+    for directory in (base / "nested_plasma", base):
+        if directory.is_dir():
+            for candidate in sorted(directory.glob("wayland-*")):
+                if candidate.is_socket() and candidate.stat().st_uid == os.getuid():
+                    info(f"WAYLAND_DISPLAY is unset; attaching to the compositor at {candidate}")
+                    os.environ["XDG_RUNTIME_DIR"] = str(candidate.parent)
+                    return base, candidate
+    raise LaunchError(
+        "WAYLAND_DISPLAY isn't set and no compositor socket exists under "
+        f"{base}. Launch from Konsole inside Steam Frame's Desktop panel, "
+        "not from a plain SSH shell."
+    )
 
 
 def kwin_wrapper(mount: Path, width: int, height: int) -> None:

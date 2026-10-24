@@ -146,6 +146,11 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
 
 ## Troubleshooting
 
+- **"WAYLAND_DISPLAY isn't set" from the `+` menu** — fixed: the `+` menu
+  launches Konsole from gamescope's outer session, which has no Wayland
+  display; the script now auto-discovers the running nested Plasma compositor
+  socket under the user runtime. (Still fails from a plain SSH shell, as it
+  must.)
 - **Menu window flashes open and closes** — fixed: the script now prepends
   `~/.local/bin` to `PATH` itself (menu-launched Konsole inherits Plasma's
   minimal `PATH`, which hides `guix-env`), and the launcher runs
