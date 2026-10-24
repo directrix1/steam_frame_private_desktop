@@ -768,7 +768,8 @@ def menu_entry_text() -> str:
             "StartupNotify=false\n")
 
 
-def install_menu_entry(share_clipboard: bool | None) -> None:
+def install_menu_entry(share_clipboard: bool | None, width: int | None,
+                       height: int | None) -> None:
     script = Path(__file__).resolve()
     if any(ch in str(script) for ch in ('"', '\n', '\r', '\\')):
         raise LaunchError("Script pathname is not safe to embed in the launcher wrapper")
@@ -778,6 +779,8 @@ def install_menu_entry(share_clipboard: bool | None) -> None:
     python3 = shutil.which("python3") or "/usr/bin/python3"
     MENU_WRAPPER.parent.mkdir(parents=True, exist_ok=True)
     flags = {None: "", True: " --share-clipboard", False: " --no-share-clipboard"}[share_clipboard]
+    if width is not None and height is not None:
+        flags += f" --width {width} --height {height}"
     # All output (ours plus the nested session's inherited stdout/stderr) is
     # teed to LAUNCH_LOG so a failed launch leaves a readable trail. bash is
     # used for PIPESTATUS so the log records the script's own exit code, not
@@ -819,8 +822,8 @@ def remove_menu_entry() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--width", type=int, default=1920)
-    parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--install-launcher", "--make-launcher", dest="install_launcher",
                         action="store_true",
                         help="Install the Frame '+' menu entry (Konsole wrapper + .desktop) and exit")
@@ -835,8 +838,6 @@ def main() -> int:
     parser.add_argument("--reset-empty-vault", action="store_true",
                         help="Archive and reinitialize an EMPTY vault; don't use routinely")
     args = parser.parse_args()
-    if not (640 <= args.width <= 8192 and 480 <= args.height <= 8192):
-        parser.error("Window dimensions must be between 640x480 and 8192x8192")
     if os.geteuid() == 0:
         raise LaunchError("Run as steamos, not root")
     os.umask(0o077)
@@ -849,11 +850,15 @@ def main() -> int:
 
     home = Path.home().resolve()
     if args.install_launcher:
-        install_menu_entry(args.share_clipboard)
+        install_menu_entry(args.share_clipboard, args.width, args.height)
         return 0
     if args.remove_launcher:
         remove_menu_entry()
         return 0
+    args.width = args.width if args.width is not None else 1920
+    args.height = args.height if args.height is not None else 1080
+    if not (640 <= args.width <= 8192 and 480 <= args.height <= 8192):
+        parser.error("Window dimensions must be between 640x480 and 8192x8192")
     if not sys.stdin.isatty():
         raise LaunchError("Launch from a terminal so the passphrase can be entered securely")
 
@@ -886,6 +891,17 @@ def main() -> int:
         mount = state / "mount"
         mount.mkdir(parents=True, exist_ok=True)
         mount.chmod(0o700)
+        # A force-killed session (window closed, kill -9) leaves the FUSE
+        # connection dead: stat says unmounted but every access raises
+        # ENOTCONN. Sweep such orphans before the checks below, which would
+        # otherwise die on them.
+        try:
+            mount.stat()
+        except OSError as exc:
+            info(f"Clearing dead leftover mount at {mount} ...")
+            subprocess.run(["fusermount3", "-u", str(mount)], check=False)
+            if os.path.ismount(mount):
+                subprocess.run(["umount", "-l", str(mount)], check=False)
         if os.path.ismount(mount):
             raise LaunchError(f"A previous decrypted mount is already active: {mount}; refusing to proceed")
         if any(mount.iterdir()):
