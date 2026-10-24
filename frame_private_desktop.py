@@ -154,7 +154,7 @@ def ensure_empty_vault_reset(cipher: Path) -> None:
     info(f"Previous EMPTY encrypted vault archived to: {backup}")
 
 
-def find_outer_wayland() -> tuple[Path, Path]:
+def find_outer_wayland(attach: str = "auto") -> tuple[Path, Path]:
     """Accept Steam Frame's nested_plasma runtime without trusting arbitrary paths.
 
     Steam Frame's Desktop runs another Plasma Wayland compositor using
@@ -179,22 +179,25 @@ def find_outer_wayland() -> tuple[Path, Path]:
         )
 
     display = os.environ.get("WAYLAND_DISPLAY", "")
-    if display:
+    if display and attach == "auto":
         socket = Path(display) if display.startswith("/") else runtime / display
         if not socket.is_socket() or not socket.resolve().is_relative_to(base.resolve()):
             raise LaunchError(f"Host Wayland socket isn't accessible under {base}: {socket}")
         return base, socket
     # A '+'-menu launch starts Konsole from gamescope's outer session, which
     # has no WAYLAND_DISPLAY at all. Discover a running compositor instead of
-    # failing, preferring the socket the user of a '+' launch can actually
-    # see: gamescope's own display (the headset gaming-mode screen) first,
-    # then a nested Plasma desktop session if one is running. The existing
-    # checks (real socket, owned by us, under the user runtime) apply to all.
-    candidates = (
-        (base, re.compile(r"gamescope-\d+\Z"), "Steam session compositor (headset display)"),
-        (base / "nested_plasma", re.compile(r"wayland-\d+\Z"), "Plasma desktop compositor"),
-        (base, re.compile(r"wayland-\d+\Z"), "compositor"),
-    )
+    # failing. Prefer the Plasma desktop session: nesting inside it gives the
+    # private KWin a properly synthesized seat, while nesting directly on
+    # Steam's weston drops pointer button-release events (stuck clicks) for
+    # all but keyboard users. --attach=steam forces the direct route; with no
+    # desktop session running it is the only route. The existing checks
+    # (real socket, owned by us, under the user runtime) apply to all.
+    desktop = (base / "nested_plasma", re.compile(r"wayland-\d+\Z"), "Plasma desktop compositor")
+    steam = (base, re.compile(r"gamescope-\d+\Z"), "Steam session compositor (headset display)")
+    other = (base, re.compile(r"wayland-\d+\Z"), "compositor")
+    candidates = {"desktop": (desktop,),
+                  "steam": (steam,),
+                  "auto": (desktop, steam, other)}[attach]
     for directory, pattern, label in candidates:
         if not directory.is_dir():
             continue
@@ -203,13 +206,17 @@ def find_outer_wayland() -> tuple[Path, Path]:
             if (pattern.fullmatch(name) and candidate.is_socket()
                     and candidate.stat().st_uid == os.getuid()):
                 info(f"WAYLAND_DISPLAY is unset; attaching to the {label} at {candidate}")
+                if label.startswith("Steam"):
+                    info("Tip: controller input is only fully reliable inside the "
+                         "Plasma desktop session; start it first (Desktop panel) "
+                         "and relaunch for mouse-perfect nesting.")
                 os.environ["XDG_RUNTIME_DIR"] = str(candidate.parent)
                 return base, candidate
     raise LaunchError(
-        "WAYLAND_DISPLAY isn't set and no compositor socket exists under "
-        f"{base}. From the '+' menu, Steam's compositor socket should be there; "
-        "from a desktop terminal, log in to Plasma first. Either way this cannot "
-        "run from a plain SSH shell."
+        f"WAYLAND_DISPLAY isn't set and no compositor for --attach={attach} "
+        f"exists under {base}. From the '+' menu: start the Desktop panel for "
+        "reliable input, or log out of Plasma to use Steam's compositor directly. "
+        "Either way this cannot run from a plain SSH shell."
     )
 
 
@@ -835,6 +842,10 @@ def main() -> int:
                                 "inside the KDE desktop; off by default from the '+' menu)")
     clipboard.add_argument("--no-share-clipboard", dest="share_clipboard", action="store_false",
                            help="Disable clipboard sharing to keep private clipboard data off the host")
+    parser.add_argument("--attach", choices=("auto", "desktop", "steam"), default="auto",
+                        help="Which compositor to nest on when none is given: 'auto' prefers the "
+                             "Plasma desktop session (reliable controller input), falling back to "
+                             "Steam's own compositor; 'desktop'/'steam' force one (default: auto)")
     parser.add_argument("--reset-empty-vault", action="store_true",
                         help="Archive and reinitialize an EMPTY vault; don't use routinely")
     args = parser.parse_args()
@@ -872,7 +883,7 @@ def main() -> int:
             info("Launched from the '+' menu: clipboard sharing is off by default. "
                  "Pass --share-clipboard to bridge with the desktop session anyway.")
 
-    runtime_base, wayland_socket = find_outer_wayland()
+    runtime_base, wayland_socket = find_outer_wayland(args.attach)
     state = home / REL_STATE
     state.mkdir(parents=True, exist_ok=True)
     state.chmod(0o700)
@@ -889,19 +900,23 @@ def main() -> int:
         # Prefer the writable ext4 filesystem where manual -fg FUSE testing
         # succeeded, rather than the /run/user tmpfs that has not been tested.
         mount = state / "mount"
+        # A force-killed session leaves the FUSE connection dead: the
+        # mountpoint exists but EVERY access - stat, chmod, iterdir - raises
+        # ENOTCONN. Sweep such orphans before anything else touches them, so
+        # a killed session can never wedge later launches.
+        try:
+            mount.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            info(f"Clearing dead leftover mount at {mount} ({exc.strerror}) ...")
+            subprocess.run(["fusermount3", "-u", str(mount)], check=False)
+            # os.path.ismount reports False for dead mounts, so probe
+            # /proc/self/mountinfo instead of trusting it.
+            if any(str(mount) in line for line in Path("/proc/self/mountinfo").read_text().splitlines()):
+                subprocess.run(["umount", "-l", str(mount)], check=False)
         mount.mkdir(parents=True, exist_ok=True)
         mount.chmod(0o700)
-        # A force-killed session (window closed, kill -9) leaves the FUSE
-        # connection dead: stat says unmounted but every access raises
-        # ENOTCONN. Sweep such orphans before the checks below, which would
-        # otherwise die on them.
-        try:
-            mount.stat()
-        except OSError as exc:
-            info(f"Clearing dead leftover mount at {mount} ...")
-            subprocess.run(["fusermount3", "-u", str(mount)], check=False)
-            if os.path.ismount(mount):
-                subprocess.run(["umount", "-l", str(mount)], check=False)
         if os.path.ismount(mount):
             raise LaunchError(f"A previous decrypted mount is already active: {mount}; refusing to proceed")
         if any(mount.iterdir()):
