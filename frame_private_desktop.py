@@ -185,20 +185,31 @@ def find_outer_wayland() -> tuple[Path, Path]:
             raise LaunchError(f"Host Wayland socket isn't accessible under {base}: {socket}")
         return base, socket
     # A '+'-menu launch starts Konsole from gamescope's outer session, which
-    # has no WAYLAND_DISPLAY at all. Discover the running nested Plasma
-    # compositor instead of failing; find_outer_wayland's existing checks
-    # (socket type, ownership, under the user runtime) still apply.
-    for directory in (base / "nested_plasma", base):
-        if directory.is_dir():
-            for candidate in sorted(directory.glob("wayland-*")):
-                if candidate.is_socket() and candidate.stat().st_uid == os.getuid():
-                    info(f"WAYLAND_DISPLAY is unset; attaching to the compositor at {candidate}")
-                    os.environ["XDG_RUNTIME_DIR"] = str(candidate.parent)
-                    return base, candidate
+    # has no WAYLAND_DISPLAY at all. Discover a running compositor instead of
+    # failing, preferring the socket the user of a '+' launch can actually
+    # see: gamescope's own display (the headset gaming-mode screen) first,
+    # then a nested Plasma desktop session if one is running. The existing
+    # checks (real socket, owned by us, under the user runtime) apply to all.
+    candidates = (
+        (base, re.compile(r"gamescope-\d+\Z"), "Steam session compositor (headset display)"),
+        (base / "nested_plasma", re.compile(r"wayland-\d+\Z"), "Plasma desktop compositor"),
+        (base, re.compile(r"wayland-\d+\Z"), "compositor"),
+    )
+    for directory, pattern, label in candidates:
+        if not directory.is_dir():
+            continue
+        for name in sorted(entry.name for entry in directory.iterdir()):
+            candidate = directory / name
+            if (pattern.fullmatch(name) and candidate.is_socket()
+                    and candidate.stat().st_uid == os.getuid()):
+                info(f"WAYLAND_DISPLAY is unset; attaching to the {label} at {candidate}")
+                os.environ["XDG_RUNTIME_DIR"] = str(candidate.parent)
+                return base, candidate
     raise LaunchError(
         "WAYLAND_DISPLAY isn't set and no compositor socket exists under "
-        f"{base}. Launch from Konsole inside Steam Frame's Desktop panel, "
-        "not from a plain SSH shell."
+        f"{base}. From the '+' menu, Steam's compositor socket should be there; "
+        "from a desktop terminal, log in to Plasma first. Either way this cannot "
+        "run from a plain SSH shell."
     )
 
 
