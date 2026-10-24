@@ -711,7 +711,9 @@ def install_menu_entry(share_clipboard: bool) -> None:
     flags = "" if share_clipboard else " --no-share-clipboard"
     wrapper = ("#!/bin/sh\n"
                "# Opens the Frame private KDE desktop controller in a Konsole window.\n"
-               f"exec {shlex.quote(terminal)} -e {shlex.quote(python3)} "
+               "# --hold keeps the window open after the command exits so passphrase\n"
+               "# prompts, sudo errors, and unmount warnings remain readable.\n"
+               f"exec {shlex.quote(terminal)} --hold -e {shlex.quote(python3)} "
                f"{shlex.quote(str(script))}{flags}\n")
     MENU_WRAPPER.write_text(wrapper, encoding="utf-8")
     MENU_WRAPPER.chmod(0o755)
@@ -754,6 +756,11 @@ def main() -> int:
         raise LaunchError("Run as steamos, not root")
     os.umask(0o077)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    # Menu/GameMode launchers inherit Plasma's minimal PATH without ~/.local/bin,
+    # where guix-rootless puts guix-env. Prepend it so command() can find it.
+    local_bin = str(Path.home() / ".local/bin")
+    if local_bin not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = local_bin + os.pathsep + os.environ.get("PATH", "")
 
     home = Path.home().resolve()
     if args.install_launcher:

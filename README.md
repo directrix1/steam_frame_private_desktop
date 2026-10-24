@@ -146,6 +146,10 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
 
 ## Troubleshooting
 
+- **Menu window flashes open and closes** — fixed: the script now prepends
+  `~/.local/bin` to `PATH` itself (menu-launched Konsole inherits Plasma's
+  minimal `PATH`, which hides `guix-env`), and the launcher runs
+  `konsole --hold`, so the window stays open on any error for you to read.
 - **"guix-env was not found"** — install
   [guix-rootless](https://github.com/directrix1/guix-rootless) first.
 - **"Launch from a terminal"** — the passphrase needs a real TTY; use Konsole,
