@@ -1,1166 +1,849 @@
 #!/usr/bin/env python3
-"""Steam Frame: terminal-managed gocryptfs private home and (Private) KDE launchers.
+"""Steam Frame private KDE desktop backed by gocryptfs (v13).
 
-Install once:  ./frame_private_desktop.py --install-launcher
-Run from the Frame '+' menu as "Private Desktop", or run the script in Konsole.
-Unlocking applies --resolution 1920x1080 to the desktop by default; use
---resolution keep to leave it. Ctrl+C/SIGTERM exits, terminates private apps,
-unmounts and removes launchers. A same-file watchdog attempts cleanup after
-SIGKILL/crash. Preserves the encrypted vault. --remove-launcher undoes install.
+First use: installs/copies gocryptfs from rootless Guix if needed and initializes
+an encrypted vault. Later uses: unlock -> nested KDE -> unmount.
 
-Security: encryption at rest only. Your normal login user can access the
-plaintext FUSE mount while open, and the host services are shared. Single-
-instance applications may forward work into an already-running host process.
+Install once with --install-launcher to get a "Private Desktop" entry in the
+Frame '+' menu (a Konsole wrapper with a space-free absolute Exec, as the
+SteamOS scanner requires); --remove-launcher undoes it. The nested desktop
+defaults to 1920x1080; override with --width/--height.
+
+Uses the SteamOS dynamic linker plus gocryptfs -fg, as tested on Steam Frame.
+It deliberately does not invoke the relocatable Guix pack wrapper for mounts.
+
+Synchronizes text clipboards in both directions using wl-clipboard >=2.3
+by default (disable with
+--no-share-clipboard); this can expose passwords to host clipboard history.
+Shares host SYSTEM Flatpak installations read-only, while keeping the
+private --user Flatpak installation and application data encrypted.
+The host steamos --user Flatpak installation is not imported.
+
+Uses a volatile /run/setuid-programs/fusermount3 helper symlink because Guix's
+build expects that pathname. May request sudo once per boot. Does not change
+SteamOS /usr, /etc, PAM, or the original Guix wrapper.
+
+Security model: encryption at rest ONLY. While unlocked, ordinary host programs
+running as the same user can access the host-visible plaintext mount. A separate
+bwrap mount namespace does not change that. Never suspend while unlocked.
 """
+
 from __future__ import annotations
+
 import argparse
-import configparser
+from datetime import datetime, timezone
+import textwrap
 import fcntl
-import getpass
-import hashlib
-import json
-import os
 import re
+import os
+from pathlib import Path
 import resource
 import shlex
 import shutil
 import signal
-import socket
 import stat
-import struct
 import subprocess
 import sys
-import threading
 import time
-from pathlib import Path
 
-APP = 'frame-private-terminal'
-HOME = Path.home().resolve()
-STATE = HOME / '.local/share/frame-private-desktop'
-CIPHER = STATE / 'encrypted'
-MOUNT = STATE / 'mount'
-LAUNCH_DIR = HOME / '.local/share/applications'
-MAP_PATH = MOUNT / '.local/state/frame-private-tray/launchers.json'
-IPC = STATE / 'tray.sock'
-LOCK = STATE / 'tray.lock'
-PIDS = STATE / 'terminal-app-pids.json'
-FUSE_PID = STATE / 'terminal-fuse-pid.json'
-WATCHDOG_LOG = STATE / 'terminal-watchdog.log'
-BIN = HOME / '.local/bin/gocryptfs-native'
-LOADER = Path('/lib/ld-linux-aarch64.so.1')
-HELPER = Path('/usr/bin/fusermount3')
-GUIX_HELPER = Path('/run/setuid-programs/fusermount3')
-PREFIX = 'frame-private-app-'
-GUIX_ENV = HOME / '.local/bin/guix-env'
-SETUP_LOG = STATE / 'dependency-install.log'
-DESKTOP_ID = 'frame-private-desktop.desktop'
-MENU_ENTRY = LAUNCH_DIR / DESKTOP_ID
-MENU_WRAPPER = HOME / '.local/bin/frame-private-desktop-launch'
-DEFAULT_RESOLUTION = '1920x1080'
-os.umask(0o077)
+APP = "frame-private-desktop"
+REL_STATE = Path(".local/share/frame-private-desktop")
+NATIVE_BINARY = Path(".local/bin/gocryptfs-native")
+HOST_LOADER = Path("/lib/ld-linux-aarch64.so.1")
+HOST_HELPER = Path("/usr/bin/fusermount3")
+GUIX_HELPER = Path("/run/setuid-programs/fusermount3")
+DESKTOP_ID = "frame-private-desktop.desktop"
+MENU_ENTRY = Path.home() / ".local/share/applications" / DESKTOP_ID
+MENU_WRAPPER = Path.home() / ".local/bin/frame-private-desktop-launch"
 
 
-def info(msg):
-    print(f'[{APP}] {msg}', flush=True)
-
-
-def guix_env_path():
-    if GUIX_ENV.is_file() and os.access(GUIX_ENV, os.X_OK):
-        return str(GUIX_ENV)
-    cmd = shutil.which('guix-env')
-    if cmd:
-        return cmd
-    raise PrivateError('Rootless guix-env not found under ~/.local/bin')
-
-
-def setup_log(msg):
-    mkdir_private(STATE)
-    with SETUP_LOG.open('a', encoding='utf-8') as log:
-        os.chmod(SETUP_LOG, 0o600)
-        log.write(time.strftime('%Y-%m-%d %H:%M:%S ') + msg + '\n')
-    info(msg)
-
-
-def guix_run(*args, check=True):
-    command = [guix_env_path(), *args]
-    setup_log('Guix command: ' + shlex.join(command))
-    with SETUP_LOG.open('a', encoding='utf-8') as log:
-        r = subprocess.run(command, stdin=subprocess.DEVNULL,
-                           stdout=log, stderr=subprocess.STDOUT)
-    if check and r.returncode:
-        raise PrivateError('Guix command failed: ' + shlex.join(command) +
-                           '\nSee ' + str(SETUP_LOG))
-    return r.returncode == 0
-
-
-def guix_has_command(name):
-    return guix_run('sh', '-c', 'command -v ' + shlex.quote(name) + ' >/dev/null 2>&1', check=False)
-
-
-def guix_install_missing(packages):
-    if packages:
-        setup_log('Installing Guix packages: ' + ', '.join(packages))
-        guix_run('guix', 'install', *packages)
-
-
-class PrivateError(RuntimeError):
+class LaunchError(Exception):
     pass
 
 
-def mkdir_private(path):
-    path.mkdir(parents=True, exist_ok=True)
-    path.chmod(0o700)
+def info(message: str) -> None:
+    print(f"[{APP}] {message}", flush=True)
 
 
-def mounted():
-    return os.path.ismount(MOUNT)
+def run(args: list[str], *, check: bool = True, **kwargs):
+    return subprocess.run(args, check=check, **kwargs)
 
 
-def native_gocryptfs_works(path=BIN):
-    if not LOADER.is_file() or not path.is_file():
-        return False
-    try:
-        r = subprocess.run([str(LOADER), str(path), '-version'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=15)
-        return r.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def ensure_native_gocryptfs():
-    # Exact v13 layout: the Guix ELF is copied and run with the SteamOS loader.
-    if native_gocryptfs_works():
-        return
-    if not LOADER.is_file():
-        raise PrivateError(f'Steam Frame ARM64 dynamic loader is missing: {LOADER}')
-    if not guix_has_command('gocryptfs'):
-        guix_install_missing(['gocryptfs'])
-    if not guix_has_command('gocryptfs'):
-        raise PrivateError(f'gocryptfs not available in Guix after installation. See {SETUP_LOG}')
-    BIN.parent.mkdir(parents=True, exist_ok=True)
-    tmp = BIN.with_name(BIN.name + f'.tmp-{os.getpid()}')
-    tmp.unlink(missing_ok=True)
-    try:
-        # Pass $1 as a positional argument, not in a string of shell syntax.
-        script = 'set -eu; src=$(readlink -f "$(command -v gocryptfs)"); install -m 755 "$src" "$1"'
-        guix_run('sh', '-c', script, 'frame-private-tray', str(tmp))
-        if not native_gocryptfs_works(tmp):
-            raise PrivateError('Guix gocryptfs copy cannot run via SteamOS loader. '
-                               f'Left the old binary untouched. See {SETUP_LOG}')
-        os.replace(tmp, BIN)
-        setup_log(f'Native gocryptfs installed/updated: {BIN}')
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def gocryptfs_cmd():
-    ensure_native_gocryptfs()
-    return [str(LOADER), str(BIN)]
-
-
-def ensure_bwrap():
-    if shutil.which('bwrap'):
-        return
-    if not guix_has_command('bwrap'):
-        guix_install_missing(['bubblewrap'])
-    if not guix_has_command('bwrap'):
-        raise PrivateError('Bubblewrap unavailable after Guix installation; see dependency-install.log')
-    # The Guix wrapper adds its profile's commands to PATH, but we must not
-    # run a copied Guix ELF directly against SteamOS shared libraries.
-    if not os.environ.get('_FRAME_PRIVATE_TERMINAL_GUIX'):
-        print('Restarting under your existing guix-env to use Bubblewrap...', flush=True)
-        env = os.environ.copy()
-        env['_FRAME_PRIVATE_TERMINAL_GUIX'] = '1'
-        os.execve(guix_env_path(), [guix_env_path(), 'python3', str(Path(__file__).resolve()), *sys.argv[1:]], env)
-    if not shutil.which('bwrap'):
-        raise PrivateError('Bubblewrap was installed but is unavailable in guix-env PATH')
-
-
-def ensure_fuse_helper():
-    """Use the host's trusted setuid FUSE helper at Guix's expected pathname."""
-    if not HELPER.is_file() or not (HELPER.stat().st_mode & stat.S_ISUID):
-        raise PrivateError('The SteamOS host requires a setuid /usr/bin/fusermount3')
-    if GUIX_HELPER.exists() or GUIX_HELPER.is_symlink():
-        if GUIX_HELPER.resolve() != HELPER.resolve():
-            raise PrivateError('Unexpected /run/setuid-programs/fusermount3; refusing overwrite')
-        return
-    if GUIX_HELPER.parent.exists():
-        s = GUIX_HELPER.parent.lstat()
-        if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0:
-            raise PrivateError('Unsafe /run/setuid-programs ownership')
-    if not sys.stdin.isatty():
-        raise PrivateError('FUSE helper alias missing; run this app from an interactive terminal')
-    if not shutil.which('sudo'):
-        raise PrivateError('sudo is needed once per boot to create the FUSE helper alias')
-    print('Creating temporary Guix FUSE helper alias (sudo may ask for your login password).', flush=True)
-    for task in (["sudo", "install", "-d", "-m", "0755", str(GUIX_HELPER.parent)],
-                 ["sudo", "ln", "-s", str(HELPER), str(GUIX_HELPER)]):
-        subprocess.run(task, check=True)
-    if GUIX_HELPER.resolve() != HELPER.resolve():
-        raise PrivateError('FUSE helper setup failed')
-
-
-def passfile_call(cmd, password, *, background=False, log=None):
-    """Send passphrase via inherited anonymous pipe: never argv, env, or disk."""
-    rd, wr = os.pipe()
-    try:
-        os.write(wr, password.encode('utf-8') + b'\n')
-        os.close(wr)
-        wr = -1
-        full = [*cmd, '-passfile', f'/proc/self/fd/{rd}']
-        if background:
-            return subprocess.Popen(full, pass_fds=(rd,), stdin=subprocess.DEVNULL,
-                                    stdout=log, stderr=subprocess.STDOUT)
-        return subprocess.run(full, pass_fds=(rd,), stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    finally:
-        os.close(rd)
-        if wr >= 0:
-            os.close(wr)
-
-
-def private_runtime():
-    base = Path(f'/run/user/{os.getuid()}')
-    if not base.is_dir() or base.stat().st_uid != os.getuid():
-        raise PrivateError('No valid host runtime directory')
-    env_runtime = Path(os.environ.get('XDG_RUNTIME_DIR', str(base)))
-    if not env_runtime.is_absolute() or not env_runtime.resolve().is_relative_to(base.resolve()):
-        raise PrivateError('XDG_RUNTIME_DIR is not within the current user runtime')
-    display = os.environ.get('WAYLAND_DISPLAY', '')
-    if not display:
-        raise PrivateError('Run inside your active KDE Wayland desktop session')
-    wayland = Path(display) if display.startswith('/') else env_runtime / display
-    if not wayland.is_socket() or not wayland.resolve().is_relative_to(base.resolve()):
-        raise PrivateError('The current Plasma Wayland socket is missing')
-    # Prefer the exact bus of the CURRENT Plasma session, not a second bus
-    # that happens to exist in the Steam Frame nested_plasma runtime.
-    addr = os.environ.get('DBUS_SESSION_BUS_ADDRESS', '')
-    match = re.search(r'(?:^|;)unix:path=([^,;]+)', addr)
-    bus = Path(match.group(1)) if match else base / 'bus'
-    if not bus.is_socket():
-        bus = env_runtime / 'bus'
-    if not bus.is_socket() or not bus.resolve().is_relative_to(base.resolve()):
-        raise PrivateError('No existing KDE session D-Bus socket found')
-    return base, wayland, bus
-
-
-def resolver_bind():
-    target = Path('/etc/resolv.conf').resolve()
-    if not target.is_file():
-        raise PrivateError('Cannot find /etc/resolv.conf target')
-    return [] if str(target) == '/etc/resolv.conf' else ['--ro-bind', str(target), str(target)]
-
-
-def audio_sockets(base, wayland):
-    dirs = [base, wayland.parent]
-    if os.environ.get('PIPEWIRE_RUNTIME_DIR'):
-        dirs.append(Path(os.environ['PIPEWIRE_RUNTIME_DIR']))
-    result = {}
-    for folder in dirs:
-        try:
-            folder = folder.resolve()
-            if not folder.is_relative_to(base.resolve()):
-                continue
-            for name in ('pipewire-0', 'pulse/native'):
-                p = folder / name
-                if name not in result and p.is_socket() and p.stat().st_uid == os.getuid():
-                    result[name] = p
-        except OSError:
-            continue
-    return result
-
-
-def sandbox_command(program, arguments):
-    """One app in its own bwrap namespace, using host desktop *services*."""
-    base, wayland, bus = private_runtime()
-    guix = HOME / '.local/share/guix'
-    if not (guix / 'gnu/store').is_dir() or not (guix / 'var/guix').is_dir():
-        raise PrivateError('Rootless Guix store not found at ~/.local/share/guix')
-    if not mounted():
-        raise PrivateError('Encrypted home is locked')
-    bwrap = shutil.which('bwrap')
-    if not bwrap:
-        raise PrivateError('The SteamOS host needs bubblewrap (bwrap)')
-
-    uid = os.getuid()
-    user = os.environ.get('USER', HOME.name)
-    runtime = f'/run/user/{uid}'
-    inside_wayland = 'frame-host-wayland'
-    profile = '/opt/guix-profile'
-    audio = audio_sockets(base, wayland)
-    env = {
-        'HOME': str(HOME), 'USER': user, 'LOGNAME': user,
-        'SHELL': '/bin/sh',
-        'PATH': f'{HOME}/.local/bin:{profile}/bin:/usr/local/bin:/usr/bin:/bin',
-        'GUIX_PROFILE': profile,
-        'XDG_RUNTIME_DIR': runtime,
-        'WAYLAND_DISPLAY': inside_wayland,
-        'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime}/bus',
-        'XDG_SESSION_TYPE': 'wayland', 'XDG_CURRENT_DESKTOP': 'KDE',
-        'XDG_SESSION_DESKTOP': 'KDE', 'KDE_FULL_SESSION': 'true',
-        'KDE_SESSION_VERSION': '6', 'QT_QPA_PLATFORM': 'wayland',
-        'XDG_CONFIG_HOME': str(HOME / '.config'),
-        'XDG_DATA_HOME': str(HOME / '.local/share'),
-        'XDG_CACHE_HOME': str(HOME / '.cache'),
-        'XDG_STATE_HOME': str(HOME / '.local/state'),
-        'XDG_CONFIG_DIRS': '/etc/xdg',
-        'XDG_DATA_DIRS': f'{HOME}/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:{profile}/share:/usr/local/share:/usr/share',
-        'FLATPAK_USER_DIR': f'{HOME}/.local/share/flatpak',
-        'FLATPAK_SYSTEM_DIR': '/var/lib/flatpak',
-        'LANG': os.environ.get('LANG', 'C.UTF-8'),
-        'TMPDIR': '/tmp',
-    }
-    for extra in ('LC_ALL', 'LC_MESSAGES', 'TZ', 'GTK_THEME', 'QT_STYLE_OVERRIDE', 'XDG_MENU_PREFIX'):
-        if extra in os.environ:
-            env[extra] = os.environ[extra]
-    if 'pulse/native' in audio:
-        env['PULSE_SERVER'] = f'unix:{runtime}/pulse/native'
-    # Xwayland fallback for non-Wayland-native applications.
-    xdisplay = os.environ.get('DISPLAY', '')
-    if re.fullmatch(r':\d+(?:\.\d+)?', xdisplay):
-        env['DISPLAY'] = xdisplay
-    if 'pipewire-0' in audio:
-        env['PIPEWIRE_RUNTIME_DIR'] = runtime
-
-    a = [bwrap, '--die-with-parent', '--new-session', '--unshare-pid', '--unshare-ipc',
-         '--share-net', '--tmpfs', '/', '--ro-bind', '/usr', '/usr',
-         '--ro-bind', '/etc', '/etc',
-         '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib',
-         '--symlink', 'usr/lib64', '/lib64', '--symlink', 'usr/sbin', '/sbin',
-         '--dir', '/gnu', '--bind', str(guix / 'gnu/store'), '/gnu/store',
-         '--dir', '/var', '--bind', str(guix / 'var/guix'), '/var/guix',
-         '--ro-bind-try', '/var/lib/flatpak', '/var/lib/flatpak',
-         '--dir', '/opt',
-         '--symlink', f'/var/guix/profiles/per-user/{user}/guix-profile', profile,
-         # This is the key: decrypted mount masks user's real home.
-         # No /host-home bind; private apps do not get the parent user's files.
-         '--dir', '/home', '--bind', str(MOUNT), str(HOME),
-         '--tmpfs', '/run', '--dir', '/run/user', '--perms', '0700',
-         '--dir', runtime,
-         '--ro-bind', str(wayland), f'{runtime}/{inside_wayland}',
-         '--ro-bind', str(bus), f'{runtime}/bus',
-         '--tmpfs', '/tmp', '--dev', '/dev', '--proc', '/proc',
-         '--dev-bind-try', '/dev/dri', '/dev/dri',
-         '--dev-bind-try', '/dev/snd', '/dev/snd',
-         '--dev-bind-try', '/dev/fuse', '/dev/fuse',
-         '--ro-bind-try', '/sys', '/sys',
-         '--chdir', str(HOME), '--clearenv']
-    a += resolver_bind()
-    if 'DISPLAY' in env and Path('/tmp/.X11-unix').is_dir():
-        a += ['--ro-bind', '/tmp/.X11-unix', '/tmp/.X11-unix']
-        auth = os.environ.get('XAUTHORITY', '')
-        if auth and Path(auth).is_file():
-            # The private home may hide ~/.Xauthority. Bind just that cookie
-            # file into a private runtime path, rather than the host home.
-            a += ['--ro-bind', auth, f'{runtime}/frame-xauthority']
-            env['XAUTHORITY'] = f'{runtime}/frame-xauthority'
-    if 'pulse/native' in audio:
-        a += ['--dir', f'{runtime}/pulse']
-    for name, sock in audio.items():
-        a += ['--ro-bind', str(sock), f'{runtime}/{name}']
-    # Some applications use system D-Bus; only pass its socket, not host /run.
-    system_bus = Path('/run/dbus/system_bus_socket')
-    if system_bus.is_socket():
-        a += ['--dir', '/run/dbus', '--ro-bind', str(system_bus), '/run/dbus/system_bus_socket']
-    for key, val in env.items():
-        a += ['--setenv', key, val]
-    # Guix programs run through the rootless Guix profile PATH automatically.
-    return a + ['--', program, *arguments]
-
-
-def read_desktop(path):
-    try:
-        cp = configparser.RawConfigParser(strict=False, interpolation=None)
-        cp.optionxform = str
-        cp.read(path, encoding='utf-8')
-        if not cp.has_section('Desktop Entry'):
-            return None
-        d = dict(cp.items('Desktop Entry'))
-        if d.get('Type', 'Application') != 'Application' or d.get('Hidden', '').lower() == 'true':
-            return None
-        if d.get('NoDisplay', '').lower() == 'true' or not d.get('Exec') or not d.get('Name'):
-            return None
-        if d.get('Exec', '').strip().startswith('env '):
-            pass  # handled as an executable + args below
-        return d
-    except (OSError, UnicodeError, configparser.Error):
-        return None
-
-
-def is_parent_flatpak_entry(path, d):
-    # Explicitly NEVER import the host's per-user Flatpaks.
-    excluded = (HOME / '.local/share/flatpak').resolve()
-    try:
-        if path.resolve().is_relative_to(excluded):
-            return True
-    except (OSError, RuntimeError):
-        return True
-    if path.parent.resolve() == (HOME / '.local/share/applications').resolve():
-        # System installs are represented separately by /var/lib/flatpak.
-        # Private-user installs are represented by MOUNT/.local/share/flatpak.
-        if re.search(r'(^|\s)(?:/\S+/)?flatpak\s+(?:\S+\s+)*run(?:\s|$)', d.get('Exec', '')):
-            return True
-    exe = d.get('Exec', '')
-    if re.search(r'(^|\s)flatpak\s+(?:\S+\s+)*--user(?:\s|$)', exe):
-        return True
-    return False
-
-
-def scan_launchers():
-    sources = [
-        MOUNT / '.local/share/applications',
-        MOUNT / '.local/share/flatpak/exports/share/applications',
-        HOME / '.local/share/applications',
-        HOME / '.guix-profile/share/applications',
-        Path('/var/lib/flatpak/exports/share/applications'),
-        Path('/usr/local/share/applications'),
-        Path('/usr/share/applications'),
-    ]
-    found, used_ids = {}, set()
-    for folder in sources:
-        if not folder.is_dir():
-            continue
-        for path in sorted(folder.rglob('*.desktop')):
-            if path.name.startswith(PREFIX) or path.name == DESKTOP_ID:
-                continue
-            d = read_desktop(path)
-            if not d or is_parent_flatpak_entry(path, d):
-                continue
-            # Prefer higher-priority XDG app definitions (including private overrides).
-            appid = path.name
-            if appid in used_ids:
-                continue
-            used_ids.add(appid)
-            ident = hashlib.sha256(str(path).encode()).hexdigest()[:24]
-            found[ident] = {'path': str(path), 'exec': d['Exec'],
-                            'name': d['Name'], 'icon': d.get('Icon', 'application-x-executable'),
-                            'categories': d.get('Categories', 'Utility;'),
-                            'terminal': d.get('Terminal', 'false'),
-                            'working_dir': d.get('Path', ''),
-                            'startup_wm_class': d.get('StartupWMClass', '')}
+def command(name: str) -> str:
+    found = shutil.which(name)
+    if not found:
+        raise LaunchError(f"Required executable not found on the SteamOS host: {name}")
     return found
 
 
-def desktop_escape(s):
-    return s.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '')
+def host_gocryptfs(binary: Path) -> list[str]:
+    """Invoke the copied Guix ELF using SteamOS glibc, no Guix namespace.
+
+    -fg is mandatory for mounts because a background self-exec would otherwise
+    omit the manually specified loader and interpret -fg as a library name.
+    """
+    if not HOST_LOADER.is_file():
+        raise LaunchError(f"SteamOS ARM64 dynamic linker missing: {HOST_LOADER}")
+    return [str(HOST_LOADER), str(binary)]
 
 
-def desktop_entry(identity, d, script):
-    # Don't carry through actions, DBusActivatable, TryExec or foreign Exec.
-    # Force all invocations into this one script's authenticated IPC launcher.
-    name = d['name'].replace('\n', ' ') + ' (Private)'
-    exec_line = f'"{desktop_escape(str(script))}" --launch {identity} %U'
-    # The script has a python3 shebang and is installed as executable.
-    return ('[Desktop Entry]\nType=Application\n'
-            f'Name={name}\n'
-            f'Comment=Run with encrypted private home and Guix profile\n'
-            f'Icon={d["icon"]}\n'
-            f'Exec={exec_line}\n'
-            f'Categories={d["categories"]}\n'
-            'Terminal=false\nStartupNotify=true\nDBusActivatable=false\n')
+def ensure_native_gocryptfs(home: Path) -> Path:
+    binary = home / NATIVE_BINARY
+    if not binary.is_file():
+        command("guix-env")
+        info("Native gocryptfs copy missing; retrieving it from rootless Guix ...")
+        check = run(["guix-env", "sh", "-c", "command -v gocryptfs >/dev/null 2>&1"], check=False)
+        if check.returncode != 0:
+            info("Installing gocryptfs into the Guix profile ...")
+            run(["guix-env", "guix", "install", "gocryptfs"])
+        script = (
+            'set -e; src=$(readlink -f "$(command -v gocryptfs)"); '
+            'install -m 755 "$src" "$1"'
+        )
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        run(["guix-env", "sh", "-c", script, "frame-private", str(binary)])
+    check = run(host_gocryptfs(binary) + ["-version"], check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if check.returncode != 0:
+        raise LaunchError(
+            f"Native gocryptfs is not runnable via SteamOS loader: {binary}\n"
+            f"{check.stderr.strip()}"
+        )
+    return binary
 
 
-def atomic_write(path, data, perm=0o600):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f'.tmp-{os.getpid()}')
-    try:
-        with tmp.open('w', encoding='utf-8') as f:
-            os.chmod(tmp, perm)
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+def ensure_host_fusermount_alias() -> None:
+    """Provide Guix's hardcoded setuid-helper path using a volatile /run symlink."""
+    if not HOST_HELPER.is_file() or not os.access(HOST_HELPER, os.X_OK):
+        raise LaunchError(f"SteamOS FUSE helper is unavailable: {HOST_HELPER}")
+    if not (HOST_HELPER.stat().st_mode & stat.S_ISUID):
+        raise LaunchError(f"Host FUSE helper is unexpectedly not setuid: {HOST_HELPER}")
 
+    parent = GUIX_HELPER.parent
+    if parent.exists():
+        st = parent.lstat()
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0:
+            raise LaunchError(f"Unsafe helper directory: {parent} (expected root-owned directory)")
 
-def remove_generated_launchers():
-    # Only files under our exact basename prefix. Other launchers are untouched.
-    if not LAUNCH_DIR.is_dir():
+    if GUIX_HELPER.is_symlink() or GUIX_HELPER.exists():
+        if GUIX_HELPER.resolve() != HOST_HELPER.resolve():
+            raise LaunchError(f"Unexpected existing FUSE helper at {GUIX_HELPER}")
         return
-    for path in LAUNCH_DIR.glob(PREFIX + '*.desktop'):
-        if path.is_file() or path.is_symlink():
-            path.unlink()
-    update_kde_cache()
+
+    info("Guix's gocryptfs needs a temporary helper alias under /run; sudo may ask for your password.")
+    command("sudo")
+    run(["sudo", "install", "-d", "-m", "0755", str(parent)])
+    run(["sudo", "ln", "-s", str(HOST_HELPER), str(GUIX_HELPER)])
+    if GUIX_HELPER.resolve() != HOST_HELPER.resolve():
+        raise LaunchError("Failed to create the temporary helper alias")
 
 
-def update_kde_cache():
-    command = shutil.which('kbuildsycoca6')
-    if command:
-        subprocess.Popen([command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+def ensure_empty_vault_reset(cipher: Path) -> None:
+    if not (cipher / "gocryptfs.conf").is_file():
+        raise LaunchError("Cannot reset: vault does not exist")
+    names = {p.name for p in cipher.iterdir()}
+    if names != {"gocryptfs.conf", "gocryptfs.diriv"}:
+        raise LaunchError("Refusing to reset: vault contains data or unexpected files")
+    suffix = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup = cipher.with_name(f"encrypted-exposed-backup-{suffix}")
+    if backup.exists():
+        raise LaunchError("Vault backup destination already exists")
+    cipher.rename(backup)
+    cipher.mkdir(mode=0o700)
+    info(f"Previous EMPTY encrypted vault archived to: {backup}")
 
 
-def menu_entry_text():
-    # The Frame '+' menu / Add-Library-Shortcut scanner wants: absolute Exec,
-    # no spaces in the Exec line, Type=Application, no NoDisplay, no
-    # Categories=Settings. The generated wrapper keeps the Exec to one token.
-    return ('[Desktop Entry]\n'
-            'Type=Application\n'
-            'Version=1.0\n'
-            'Name=Private Desktop\n'
-            'GenericName=Encrypted desktop\n'
-            'Comment=gocryptfs encrypted home with (Private) app launchers\n'
-            f'Exec={MENU_WRAPPER}\n'
-            'Icon=dialog-password\n'
-            'Terminal=false\n'
-            'Categories=Utility;System;\n'
-            'StartupNotify=false\n')
+def find_outer_wayland() -> tuple[Path, Path]:
+    """Accept Steam Frame's nested_plasma runtime without trusting arbitrary paths.
+
+    Steam Frame's Desktop runs another Plasma Wayland compositor using
+    XDG_RUNTIME_DIR=/run/user/<uid>/nested_plasma rather than /run/user/<uid>.
+    Store our plaintext FUSE mount under the *base* runtime directory so it
+    survives nested Plasma being restarted and can be cleaned up predictably.
+    """
+    base = Path(f"/run/user/{os.getuid()}")
+    if not base.is_dir():
+        raise LaunchError(f"Missing host runtime directory: {base}")
+    st = base.stat()
+    if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        raise LaunchError(f"Unsafe ownership or permissions on {base}")
+
+    raw = os.environ.get("XDG_RUNTIME_DIR")
+    runtime = Path(raw) if raw else base
+    if not runtime.is_absolute() or not runtime.is_dir():
+        raise LaunchError(f"Invalid XDG_RUNTIME_DIR: {raw!r}")
+    if not runtime.resolve().is_relative_to(base.resolve()):
+        raise LaunchError(
+            f"XDG_RUNTIME_DIR={runtime} is outside the SteamOS user runtime {base}"
+        )
+
+    display = os.environ.get("WAYLAND_DISPLAY", "")
+    if not display:
+        raise LaunchError(
+            "WAYLAND_DISPLAY isn't set. Launch from Konsole inside Steam Frame's "
+            "Desktop panel, not from a plain SSH shell."
+        )
+    socket = Path(display) if display.startswith("/") else runtime / display
+    if not socket.is_socket() or not socket.resolve().is_relative_to(base.resolve()):
+        raise LaunchError(f"Host Wayland socket isn't accessible under {base}: {socket}")
+    return base, socket
 
 
-def install_menu_entry():
-    terminal = shutil.which('konsole') or shutil.which('xterm')
-    if not terminal:
-        raise PrivateError('Konsole not found; install it or run the script from a terminal yourself')
+def kwin_wrapper(mount: Path, width: int, height: int) -> None:
+    """Wrap the REAL KWin Wayland launcher, retaining its D-Bus handshake.
+
+    Plasma's classic startup waits for org.kde.KWinWrapper before launching
+    kded6 and plasmashell.  Calling kwin_wayland directly bypasses registration
+    of that service and leaves the Plasma session at a black KWin window.
+    """
+    bin_dir = mount / ".local/share/frame-private-desktop/bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+
+    real_kwin = Path("/usr/bin/kwin_wayland")
+    real_wrapper = Path("/usr/bin/kwin_wayland_wrapper")
+    if not (real_kwin.is_file() and os.access(real_kwin, os.X_OK)):
+        raise LaunchError(f"Missing host KDE compositor: {real_kwin}")
+    if not (real_wrapper.is_file() and os.access(real_wrapper, os.X_OK)):
+        raise LaunchError(f"Missing host KDE compositor wrapper: {real_wrapper}")
+
+    # Replace v8's obsolete kwin_wayland shim, which added duplicate arguments.
+    kwin = bin_dir / "kwin_wayland"
+    kwin.write_text(
+        '#!/bin/sh\nexec /usr/bin/kwin_wayland "$@"\n',
+        encoding="utf-8",
+    )
+    kwin.chmod(0o700)
+
+    wrapper = bin_dir / "kwin_wayland_wrapper"
+    wrapper.write_text(
+        '#!/bin/sh\n'
+        f'exec /usr/bin/kwin_wayland_wrapper --width {width} --height {height} --no-lockscreen "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+
+
+def ensure_classic_plasma_startup(mount: Path) -> None:
+    """Force Plasma's non-systemd startup in the PRIVATE encrypted home.
+
+    Plasma 6 reads [General] systemdBoot from ~/.config/startkderc.
+    A new D-Bus session has no org.freedesktop.systemd1 user manager.
+    Preserve existing settings/other groups if a config file already exists.
+    """
+    cfg = mount / ".config/startkderc"
+    if cfg.is_symlink():
+        raise LaunchError(f"Refusing to edit symlink: {cfg}")
+    if cfg.exists() and not cfg.is_file():
+        raise LaunchError(f"Unexpected KDE configuration type: {cfg}")
+    if not cfg.exists():
+        cfg.write_text("[General]\nsystemdBoot=false\n", encoding="utf-8")
+        cfg.chmod(0o600)
+        info("Configured private Plasma to use classic (non-systemd) startup.")
+        return
+
+    contents = cfg.read_text(encoding="utf-8")
+    lines = contents.splitlines(keepends=True)
+    result = []
+    in_general = False
+    seen_general = False
+    wrote_setting = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_general and not wrote_setting:
+                result.append("systemdBoot=false\n")
+                wrote_setting = True
+            in_general = stripped == "[General]"
+            seen_general = seen_general or in_general
+        if in_general and re.match(r"^\s*systemdBoot\s*=", line):
+            if not wrote_setting:
+                result.append("systemdBoot=false\n")
+                wrote_setting = True
+            continue
+        result.append(line)
+    if in_general and not wrote_setting:
+        result.append("systemdBoot=false\n")
+    if not seen_general:
+        result.insert(0, "[General]\nsystemdBoot=false\n\n")
+    new_contents = "".join(result)
+    if new_contents != contents:
+        cfg.write_text(new_contents, encoding="utf-8")
+        info("Configured private Plasma to use classic (non-systemd) startup.")
+
+
+
+def _clipboard_version(output: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\s|$)", output)
+    return tuple(map(int, match.groups())) if match else None
+
+
+def ensure_clipboard_tools() -> str:
+    """Select wl-clipboard 2.3+ for Plasma's ext-data-control protocol.
+
+    2.2.x can appear to work yet silently fail to read a clipboard on KWin.
+    Prefer SteamOS's binaries when new enough, otherwise Guix's installed pair.
+    Return the executable directory as seen *inside* our private bwrap namespace.
+    """
+    host = Path('/usr/bin')
+    if all((host / n).is_file() for n in ('wl-paste', 'wl-copy')):
+        result = run([str(host / 'wl-paste'), '--version'], check=False,
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        ver = _clipboard_version(result.stdout)
+        if result.returncode == 0 and ver and ver >= (2, 3, 0):
+            info(f'Using SteamOS wl-clipboard {".".join(map(str, ver))} for clipboard bridging.')
+            return '/usr/bin'
+
+    command('guix-env')
+    def guix_version() -> tuple[int, int, int] | None:
+        proc = run(['guix-env', 'sh', '-c',
+                    'command -v wl-copy >/dev/null && command -v wl-paste >/dev/null && wl-paste --version'],
+                   check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return _clipboard_version(proc.stdout) if proc.returncode == 0 else None
+
+    ver = guix_version()
+    if ver is None:
+        info('Installing wl-clipboard in Guix for bidirectional clipboard ...')
+        run(['guix-env', 'guix', 'install', 'wl-clipboard'])
+        ver = guix_version()
+    if ver and ver >= (2, 3, 0):
+        info(f'Using Guix wl-clipboard {".".join(map(str, ver))} for clipboard bridging.')
+        return '/opt/guix-profile/bin'
+    raise LaunchError(
+        'Clipboard requires wl-clipboard >=2.3.0 for KDE Plasma. '
+        f'The available Guix version is {ver or "missing"}; SteamOS does not supply a compatible version. '
+        'Update the wl-clipboard package in Guix, or temporarily launch with --no-share-clipboard. '
+        'No encrypted data was changed.'
+    )
+
+
+def write_clipboard_bridge(mount: Path) -> None:
+    """Write a two-way text clipboard bridge with useful non-sensitive diagnostics.
+
+    The private startup wrapper runs the bridge before Plasma. It waits for
+    KWin's private socket, then mirrors changes in either direction. It never
+    logs clipboard contents.
+    """
+    script = mount / '.local/share/frame-private-desktop/clipboard-bridge.py'
+    if script.is_symlink():
+        raise LaunchError(f'Refusing to overwrite symlink: {script}')
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(textwrap.dedent(r"""#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RUNTIME = Path(os.environ['XDG_RUNTIME_DIR'])
+OUTER = 'frame-outer-wayland'
+INNER = 'wayland-0'
+BIN = Path(os.environ['FRAME_CLIP_BIN'])
+MAX_BYTES = 1024 * 1024
+STATES = {OUTER: 'parent', INNER: 'private'}
+last_error = {}
+
+def log(message):
+    print('[frame-clipboard] ' + message, file=sys.stderr, flush=True)
+
+def env_for(display):
+    env = os.environ.copy()
+    env['WAYLAND_DISPLAY'] = display
+    return env
+
+def report_error(display, op, reason):
+    key = (display, op)
+    if last_error.get(key) != reason:
+        log(f'{STATES[display]} {op} failed: {reason}')
+        last_error[key] = reason
+
+def paste(display):
+    # `--type text` auto-selects an available text MIME type, rather than
+    # requiring one exact charset spelling. -n avoids adding a newline.
+    try:
+        result = subprocess.run(
+            [str(BIN / 'wl-paste'), '--no-newline', '--type', 'text'],
+            env=env_for(display), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        report_error(display, 'read', type(exc).__name__)
+        return None
+    if result.returncode != 0:
+        # Empty/non-text selections are not fatal, but protocol errors are.
+        error = result.stderr.decode('utf-8', errors='replace').strip()[:180]
+        if error:
+            report_error(display, 'read', error)
+        return None
+    if len(result.stdout) > MAX_BYTES:
+        report_error(display, 'read', 'text exceeds the 1 MiB clipboard limit')
+        return None
+    return result.stdout
+
+def copy(display, data):
+    try:
+        result = subprocess.run(
+            [str(BIN / 'wl-copy'), '--type', 'text/plain;charset=utf-8'],
+            input=data, env=env_for(display), stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        report_error(display, 'write', type(exc).__name__)
+        return False
+    if result.returncode != 0:
+        error = result.stderr.decode('utf-8', errors='replace').strip()[:180]
+        report_error(display, 'write', error or f'exit code {result.returncode}')
+        return False
+    return True
+
+log(f'clipboard bridge booting; using {BIN}, waiting for private Wayland socket')
+while not (RUNTIME / INNER).is_socket():
+    time.sleep(.25)
+
+previous = {OUTER: paste(OUTER), INNER: paste(INNER)}
+log('both Wayland sockets available; monitoring bidirectionally')
+# Make it possible to copy from the host *before* entering private KDE.
+if previous[OUTER] is not None and previous[OUTER] != previous[INNER]:
+    if copy(INNER, previous[OUTER]):
+        previous[INNER] = previous[OUTER]
+        log('initial parent -> private clipboard synchronized')
+
+while (RUNTIME / INNER).is_socket():
+    sampled = {OUTER: paste(OUTER), INNER: paste(INNER)}
+    changed_outer = sampled[OUTER] is not None and sampled[OUTER] != previous[OUTER]
+    changed_inner = sampled[INNER] is not None and sampled[INNER] != previous[INNER]
+    if changed_outer or changed_inner:
+        # If changes coincide, prefer the private selection.
+        source, dest = (INNER, OUTER) if changed_inner else (OUTER, INNER)
+        if sampled[source] != sampled[dest] and copy(dest, sampled[source]):
+            sampled[dest] = sampled[source]
+            log(f'{STATES[source]} -> {STATES[dest]} clipboard synchronized')
+    previous = sampled
+    time.sleep(.35)
+log('private Wayland socket closed, exiting')
+"""), encoding='utf-8')
+    script.chmod(0o700)
+
+
+def host_resolver_bind() -> list[str]:
+    """Restore DNS when /etc/resolv.conf resolves into masked /run.
+
+    We never expose the host runtime directory wholesale. Only the actual
+    resolver configuration file is made visible at its original path.
+    """
+    path = Path("/etc/resolv.conf")
+    try:
+        actual = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise LaunchError(f"Cannot resolve host /etc/resolv.conf: {exc}") from exc
+    if not actual.is_file():
+        raise LaunchError(f"Host DNS configuration is not a regular file: {actual}")
+    if actual == path:
+        return []  # Already visible under the readonly /etc mount.
+    info(f"Exposing resolver target inside private sandbox: {actual}")
+    return ["--ro-bind", str(actual), str(actual)]
+
+
+def prepare_flatpak_bootstrap(mount: Path, *, share_clipboard: bool) -> None:
+    """Configure only a private, encrypted --user Flathub remote if missing.
+
+    Runs *within* the separate D-Bus/bwrap environment. In particular it does
+    not touch ~/.local/share/flatpak belonging to the normal steamos desktop.
+    Startup must proceed even when the network or Flatpak is unavailable.
+    """
+    bin_dir = mount / ".local/share/frame-private-desktop/bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "private-plasma-start"
+    if script.is_symlink():
+        raise LaunchError(f"Refusing to overwrite symlink: {script}")
+    script.write_text(
+        "#!/bin/sh\n"
+        "# Everything below runs inside private bwrap and the private DBus session.\n"
+        "if command -v flatpak >/dev/null 2>&1; then\n"
+        "    if ! flatpak remotes --user --columns=name 2>/dev/null | grep -Fxq flathub; then\n"
+        "        echo '[frame-private-desktop] Adding Flathub to encrypted Flatpak profile (first run only).' >&2\n"
+        "        timeout 25s flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || echo '[frame-private-desktop] WARNING: Flathub setup failed; retry from a private Konsole.' >&2\n"
+        "    fi\n"
+        "    marker=\"$HOME/.local/state/frame-private-desktop/flathub-appstream-ready\"\n"
+        "    if [ ! -e \"$marker\" ] && flatpak remotes --user --columns=name 2>/dev/null | grep -Fxq flathub; then\n"
+        "        mkdir -p \"$(dirname \"$marker\")\"\n"
+        "        ( timeout 120s flatpak update --user --appstream --noninteractive && touch \"$marker\" ) >\"$HOME/.cache/frame-private-flatpak-appstream.log\" 2>&1 &\n"
+        "    fi\n"
+        "fi\n" +
+        ("python3 \"$HOME/.local/share/frame-private-desktop/clipboard-bridge.py\" &\n"
+         "clip_pid=$!\n" if share_clipboard else "") +
+        ("trap 'kill \"$clip_pid\" 2>/dev/null || true' EXIT\n" if share_clipboard else "") +
+        "/usr/bin/startplasma-wayland\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+
+
+def find_host_audio_sockets(runtime_base: Path, wayland_socket: Path) -> dict[str, Path]:
+    """Locate host audio sockets, never bind an entire host runtime directory."""
+    runtime_dirs = [runtime_base, wayland_socket.parent]
+    extra = os.environ.get("PIPEWIRE_RUNTIME_DIR")
+    if extra:
+        runtime_dirs.append(Path(extra))
+    seen: set[Path] = set()
+    found: dict[str, Path] = {}
+    for root in runtime_dirs:
+        try:
+            root = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if root in seen or not root.is_relative_to(runtime_base.resolve()):
+            continue
+        seen.add(root)
+        for name in ("pipewire-0", "pulse/native"):
+            candidate = root / name
+            try:
+                if name not in found and candidate.is_socket() and candidate.stat().st_uid == os.getuid():
+                    found[name] = candidate
+            except OSError:
+                pass
+    return found
+
+
+def build_private_kde(home: Path, mount: Path, wayland_socket: Path, runtime_base: Path, width: int, height: int, clipboard_bin: str | None) -> list[str]:
+    prefix = home / ".local/share/guix"
+    store = prefix / "gnu/store"
+    profiles = prefix / "var/guix"
+    if not store.is_dir() or not profiles.is_dir():
+        raise LaunchError("Can't find backing rootless Guix store/profile under ~/.local/share/guix")
+
+    uid = os.getuid()
+    inner_runtime = f"/run/user/{uid}"
+    inner_socket = "frame-outer-wayland"
+    private_path = f"{home}/.local/share/frame-private-desktop/bin"
+    inner_profile = "/opt/guix-profile"
+    lang = os.environ.get("LANG", "C.UTF-8")
+    env = {
+        "HOME": str(home), "USER": "steamos", "LOGNAME": "steamos", "SHELL": "/bin/bash",
+        "PATH": f"{private_path}:{inner_profile}/bin:/usr/local/bin:/usr/bin:/bin",
+        "XDG_RUNTIME_DIR": inner_runtime,
+        "WAYLAND_DISPLAY": inner_socket,
+        "XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_DESKTOP": "KDE",
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_DATA_HOME": str(home / ".local/share"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_STATE_HOME": str(home / ".local/state"),
+        "XDG_CONFIG_DIRS": "/etc/xdg",
+        "XDG_DATA_DIRS": f"{home}/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:{inner_profile}/share:/usr/local/share:/usr/share",
+        "FLATPAK_USER_DIR": f"{home}/.local/share/flatpak",
+        "FLATPAK_SYSTEM_DIR": "/var/lib/flatpak",
+        "QT_QPA_PLATFORM": "wayland", "LANG": lang,
+        "KWIN_WAYLAND_NO_PERMISSION_CHECKS": "1",
+    }
+    if clipboard_bin:
+        env['FRAME_CLIP_BIN'] = clipboard_bin
+    for key in ("LC_ALL", "LC_MESSAGES", "TZ"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+
+    audio = find_host_audio_sockets(runtime_base, wayland_socket)
+    if "pipewire-0" in audio:
+        env["PIPEWIRE_RUNTIME_DIR"] = inner_runtime
+    if "pulse/native" in audio:
+        env["PULSE_SERVER"] = f"unix:{inner_runtime}/pulse/native"
+    if audio:
+        info("Connecting private desktop to host audio: " + ", ".join(sorted(audio)))
+    else:
+        info("WARNING: No host PipeWire/PulseAudio socket found. Audio may remain unavailable.")
+
+    args = [
+        command("bwrap"),
+        "--die-with-parent", "--unshare-pid", "--unshare-ipc", "--new-session",
+        "--share-net",  # Firefox and web apps need connectivity
+        "--tmpfs", "/",
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/etc", "/etc",
+        "--symlink", "usr/bin", "/bin",
+        "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib64", "/lib64",
+        "--symlink", "usr/sbin", "/sbin",
+        "--dir", "/gnu", "--bind", str(store), "/gnu/store",
+        "--dir", "/var", "--bind", str(profiles), "/var/guix",
+        # Expose only the host's SYSTEM Flatpak repository, not its user
+        # installation. Read-only prevents this session altering system apps.
+        "--ro-bind-try", "/var/lib/flatpak", "/var/lib/flatpak",
+        "--dir", "/opt",
+        "--symlink", "/var/guix/profiles/per-user/steamos/guix-profile", inner_profile,
+        # Bind the ORIGINAL home before masking /home/steamos with the private
+        # decrypted mount. This guarantees the intended /host-home source.
+        "--dir", "/home", "--bind", str(home), "/host-home",
+        "--bind", str(mount), str(home),
+        "--tmpfs", "/run", "--dir", "/run/user",
+        "--perms", "0700", "--dir", inner_runtime,
+        "--ro-bind", str(wayland_socket), f"{inner_runtime}/{inner_socket}",
+        "--tmpfs", "/tmp", "--perms", "1777", "--dir", "/tmp/.X11-unix", "--dev", "/dev",
+        "--dev-bind-try", "/dev/fuse", "/dev/fuse",
+        "--dev-bind-try", "/dev/dri", "/dev/dri",
+        "--dev-bind-try", "/dev/snd", "/dev/snd",
+        "--ro-bind-try", "/sys", "/sys",
+        "--proc", "/proc", "--chdir", str(home), "--clearenv",
+    ]
+    # /etc/resolv.conf is frequently a symlink into /run on SteamOS.
+    # Our private tmpfs /run would otherwise leave it dangling (offline browsers).
+    args += host_resolver_bind()
+    if "pulse/native" in audio:
+        args += ["--dir", f"{inner_runtime}/pulse"]
+    for name, src in audio.items():
+        args += ["--ro-bind", str(src), f"{inner_runtime}/{name}"]
+    for key, val in env.items():
+        args += ["--setenv", key, val]
+    args += ["--", "dbus-run-session", "--", str(home / ".local/share/frame-private-desktop/bin/private-plasma-start")]
+    return args
+
+
+def run_session(args: list[str]) -> int:
+    child = subprocess.Popen(args, start_new_session=True)
+    try:
+        return child.wait()
+    except KeyboardInterrupt:
+        info("Stopping the private KDE session ...")
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            return child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+            return 130
+
+
+def mount_foreground(binary: Path, cipher: Path, mount: Path) -> subprocess.Popen:
+    """Start the *working* non-daemonized gocryptfs command and wait for FUSE."""
+    cmd = host_gocryptfs(binary) + ["-fg", str(cipher), str(mount)]
+    info("Enter your encrypted desktop passphrase when prompted.")
+    # Keep the controlling terminal: gocryptfs needs it for the passphrase.
+    child = subprocess.Popen(cmd)
+    try:
+        # Password is read interactively by gocryptfs. Do not impose an artificial
+        # timeout on someone entering a passphrase through the headset keyboard.
+        while not os.path.ismount(mount):
+            rc = child.poll()
+            if rc is not None:
+                raise LaunchError(f"gocryptfs exited without mounting (exit status {rc})")
+            time.sleep(0.15)
+        if child.poll() is not None:
+            raise LaunchError("gocryptfs exited immediately after mount")
+        return child
+    except BaseException:
+        # This also catches Ctrl+C while the password is being entered.
+        # Don't leave an unlocked mount just because the launcher was interrupted.
+        if os.path.ismount(mount):
+            unmount(mount)
+        if not os.path.ismount(mount):
+            stop_foreground(child)
+        raise
+
+
+def stop_foreground(child: subprocess.Popen) -> None:
+    if child.poll() is not None:
+        return
+    try:
+        child.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        # Safe to stop only once the mount has been cleanly detached.
+        child.terminate()
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=3)
+
+
+def unmount(mount: Path) -> None:
+    if not os.path.ismount(mount):
+        return
+    for _ in range(7):
+        result = run(["/usr/bin/fusermount3", "-u", str(mount)], check=False,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0 and not os.path.ismount(mount):
+            info("Encrypted desktop has been locked (FUSE unmounted).")
+            return
+        time.sleep(1)
+    raise LaunchError(
+        f"The decrypted home is STILL MOUNTED at {mount}. "
+        "Stop processes using it and run: fusermount3 -u '" + str(mount) + "'. "
+        "Do not leave the headset unattended until it is unmounted."
+    )
+
+
+def refresh_kde_menus() -> None:
+    sycoca = shutil.which("kbuildsycoca6")
+    if sycoca:
+        subprocess.Popen([sycoca], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+
+
+def menu_entry_text() -> str:
+    # The Frame '+' menu / "Add Library Shortcut" scanner wants: a single-token
+    # absolute Exec with no spaces or quotes, Type=Application, no NoDisplay,
+    # no Categories=Settings. The generated wrapper supplies the Konsole window
+    # that the gocryptfs passphrase prompt needs (Terminal=false for the same
+    # reason: we open the terminal ourselves).
+    return ("[Desktop Entry]\n"
+            "Type=Application\n"
+            "Version=1.0\n"
+            "Name=Private Desktop\n"
+            "GenericName=Encrypted desktop\n"
+            "Comment=Unlock and launch a nested encrypted KDE desktop\n"
+            f"Exec={MENU_WRAPPER}\n"
+            "Icon=system-lock-screen\n"
+            "Terminal=false\n"
+            "Categories=Utility;Security;\n"
+            "StartupNotify=false\n")
+
+
+def install_menu_entry(share_clipboard: bool) -> None:
     script = Path(__file__).resolve()
+    if any(ch in str(script) for ch in ('"', '\n', '\r', '\\')):
+        raise LaunchError("Script pathname is not safe to embed in the launcher wrapper")
+    terminal = shutil.which("konsole") or shutil.which("xterm")
+    if not terminal:
+        raise LaunchError("Konsole not found; install it or run this script from a terminal yourself")
+    python3 = shutil.which("python3") or "/usr/bin/python3"
     MENU_WRAPPER.parent.mkdir(parents=True, exist_ok=True)
-    wrapper = ('#!/bin/sh\n'
-               '# Opens the Frame Private Desktop controller in a Konsole window.\n'
-               f'exec {shlex.quote(terminal)} -e {shlex.quote(str(script))}\n')
-    atomic_write(MENU_WRAPPER, wrapper, 0o755)
-    atomic_write(MENU_ENTRY, menu_entry_text(), 0o755)
-    update_kde_cache()
-    info(f'Installed menu launcher: {MENU_ENTRY} (Exec wrapper: {MENU_WRAPPER})')
+    flags = "" if share_clipboard else " --no-share-clipboard"
+    wrapper = ("#!/bin/sh\n"
+               "# Opens the Frame private KDE desktop controller in a Konsole window.\n"
+               f"exec {shlex.quote(terminal)} -e {shlex.quote(python3)} "
+               f"{shlex.quote(str(script))}{flags}\n")
+    MENU_WRAPPER.write_text(wrapper, encoding="utf-8")
+    MENU_WRAPPER.chmod(0o755)
+    MENU_ENTRY.parent.mkdir(parents=True, exist_ok=True)
+    MENU_ENTRY.write_text(menu_entry_text(), encoding="utf-8")
+    MENU_ENTRY.chmod(0o755)
+    refresh_kde_menus()
+    info(f"Installed menu launcher: {MENU_ENTRY} (Exec wrapper: {MENU_WRAPPER})")
     info('On the Frame: press + and pick "Private Desktop". If it is missing there, '
-         'copy the .desktop file into ~/Desktop as well.')
+         "copy the .desktop file into ~/Desktop as well.")
 
 
-def remove_menu_entry():
+def remove_menu_entry() -> None:
     MENU_ENTRY.unlink(missing_ok=True)
     MENU_WRAPPER.unlink(missing_ok=True)
-    update_kde_cache()
+    refresh_kde_menus()
     info('Removed the "Private Desktop" menu entry and its wrapper.')
 
 
-def make_launchers(script):
-    if not mounted():
-        raise PrivateError('Cannot generate launchers while locked')
-    mapping = scan_launchers()
-    if not mapping:
-        raise PrivateError('No launchers discovered; check the system desktop entries and Guix profile')
-    mkdir_private(MAP_PATH.parent)
-    atomic_write(MAP_PATH, json.dumps(mapping, ensure_ascii=False, indent=2), 0o600)
-    LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
-    expected = set()
-    for ident, d in mapping.items():
-        target = LAUNCH_DIR / f'{PREFIX}{ident}.desktop'
-        expected.add(target.name)
-        atomic_write(target, desktop_entry(ident, d, script), 0o644)
-    for path in LAUNCH_DIR.glob(PREFIX + '*.desktop'):
-        if path.name not in expected:
-            path.unlink()
-    update_kde_cache()
-    return len(mapping)
-
-
-def parse_exec(s, d, urls):
-    """Expand common freedesktop Exec substitutions WITHOUT invoking a shell."""
-    try:
-        parts = shlex.split(s, posix=True)
-    except ValueError as exc:
-        raise PrivateError('Invalid .desktop Exec entry: ' + str(exc)) from exc
-    out, used_files = [], False
-    files = list(urls)
-    for t in parts:
-        if t in ('%f', '%u'):
-            used_files = True
-            if files:
-                out.append(files[0])
-            continue
-        if t in ('%F', '%U'):
-            used_files = True
-            out.extend(files)
-            continue
-        if t == '%i':
-            if d.get('icon'):
-                out.extend(['--icon', d['icon']])
-            continue
-        if t == '%c':
-            out.append(d['name'])
-            continue
-        if t == '%k':
-            out.append(d['path'])
-            continue
-        # Unknown freedesktop field codes are ignored. %% means a literal %.
-        t = t.replace('%%', '\uFFF0')
-        t = re.sub(r'%[a-zA-Z]', '', t).replace('\uFFF0', '%')
-        if t:
-            out.append(t)
-    if not used_files:
-        out.extend(files)
-    # Guix-generated host .desktop entries often call the outer `guix-env`
-    # wrapper. We are ALREADY inside the private Guix profile, and that host
-    # wrapper is hidden by the private HOME bind, so remove just that prefix.
-    if out and Path(out[0]).name == 'guix-env':
-        out = out[1:]
-    # GUIX profile symlink is masked by private HOME. Inside the namespace the
-    # equivalent real rootless Guix profile is mounted at /opt/guix-profile.
-    if out and out[0].startswith(str(HOME / '.guix-profile') + '/'):
-        out[0] = '/opt/guix-profile/' + out[0][len(str(HOME / '.guix-profile')) + 1:]
-    if not out:
-        raise PrivateError('Empty .desktop Exec entry')
-    return out
-
-
-def active_launch_by_id(ident, file_args):
-    if not re.fullmatch('[0-9a-f]{24}', ident):
-        raise PrivateError('Invalid launcher ID')
-    if not mounted() or not MAP_PATH.is_file():
-        raise PrivateError('Private home locked or launcher metadata missing')
-    mapping = json.loads(MAP_PATH.read_text(encoding='utf-8'))
-    d = mapping.get(ident)
-    if d is None:
-        raise PrivateError('This private launcher no longer exists; refresh launchers')
-    argv = parse_exec(d['exec'], d, file_args)
-    # Explicitly separate the executable and its args; never run shell=True.
-    return sandbox_command(argv[0], argv[1:])
-
-
-def send_request(ident, urls):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(5)
-        s.connect(str(IPC))
-        s.sendall((json.dumps({'id': ident, 'args': urls}) + '\n').encode())
-        data = b''
-        while b'\n' not in data and len(data) < 8192:
-            part = s.recv(4096)
-            if not part:
-                break
-            data += part
-    if not data:
-        raise PrivateError('Tray did not respond')
-    reply = json.loads(data.split(b'\n')[0])
-    if not reply.get('ok'):
-        raise PrivateError(reply.get('error', 'Launch failed'))
-
-
-
-
-def start_ticks(pid):
-    """Linux process start-time ticks prevent killing a recycled PID."""
-    try:
-        return int(Path(f'/proc/{pid}/stat').read_text().rpartition(') ')[2].split()[19])
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def active_groups():
-    """Only return process groups still owned by the recorded process lifetime."""
-    try:
-        rows = json.loads(PIDS.read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        return []
-    result = []
-    for record in rows if isinstance(rows, list) else []:
-        try:
-            pid, tick = int(record['pid']), int(record['start'])
-            if pid > 1 and pid != os.getpid() and start_ticks(pid) == tick:
-                result.append((pid, tick))
-        except (TypeError, KeyError, ValueError):
-            continue
-    return result
-
-
-def stop_private_apps():
-    groups = active_groups()
-    for pgid, ticks in groups:
-        try:
-            if start_ticks(pgid) == ticks:
-                os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            info(f'Could not terminate process group {pgid}')
-    deadline = time.monotonic() + 6
-    while time.monotonic() < deadline and any(start_ticks(p) == t for p, t in groups):
-        time.sleep(.15)
-    for pgid, ticks in groups:
-        try:
-            if start_ticks(pgid) == ticks:
-                os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            info(f'Could not force-stop process group {pgid}')
-
-
-def verified_fuse_mount():
-    """Never attempt to unmount an unrelated mount placed at our path."""
-    if not mounted():
-        return False
-    target = str(MOUNT).replace(' ', '\\040')
-    try:
-        for row in Path('/proc/self/mountinfo').read_text().splitlines():
-            left, sep, right = row.partition(' - ')
-            fields = left.split()
-            if sep and len(fields) > 4 and fields[4] == target:
-                typ = right.split()[0]
-                if typ == 'fuse.gocryptfs' or typ == 'fuse' or typ.startswith('fuse.gocryptfs'):
-                    return True
-                raise PrivateError(f'Refusing to unmount unexpected filesystem ({typ}) at {MOUNT}')
-    except OSError as e:
-        raise PrivateError(f'Cannot verify decrypted FUSE mount: {e}') from e
-    raise PrivateError('Mount is present but cannot verify that it is gocryptfs')
-
-
-def unmount_private(*, retries=12):
-    if not mounted():
-        return
-    verified_fuse_mount()
-    if not HELPER.is_file():
-        raise PrivateError(f'Host unmount helper unavailable: {HELPER}')
-    last_error = ''
-    for _ in range(retries):
-        result = subprocess.run([str(HELPER), '-u', str(MOUNT)],
-                                capture_output=True, text=True, timeout=10)
-        if not mounted():
-            return
-        last_error = (result.stderr or result.stdout).strip()
-        time.sleep(.5)
-    raise PrivateError('Decrypted home is STILL MOUNTED; close applications using it. '\
-                       + last_error + '\nDo not suspend or reboot assuming it is encrypted.')
-
-
-def disable_old_gui_autostart():
-    # These are entries produced by the previous two versions, not user launchers.
-    for filename in ('frame-private-tray.desktop', 'frame-private-home.desktop'):
-        for location in (LAUNCH_DIR, HOME / '.config/autostart'):
-            (location / filename).unlink(missing_ok=True)
-
-
-def prepare_decrypted_directories():
-    for rel in ('.config', '.local/share', '.local/state', '.cache', '.var',
-                'Downloads', 'Documents', '.local/share/flatpak'):
-        path = MOUNT / rel
-        if path.is_symlink():
-            raise PrivateError('Private home has unexpected symlink: ' + str(path))
-        mkdir_private(path)
-
-
-def unlock_home():
-    mkdir_private(STATE)
-    mkdir_private(CIPHER)
-    mkdir_private(MOUNT)
-    if mounted():
-        raise PrivateError('Encrypted home is already mounted')
-    if any(MOUNT.iterdir()):
-        raise PrivateError(f'Decrypted mount directory is not empty: {MOUNT}')
-    ensure_bwrap()
-    ensure_native_gocryptfs()
-    ensure_fuse_helper()
-    new = not (CIPHER / 'gocryptfs.conf').is_file()
-    if new and any(CIPHER.iterdir()):
-        raise PrivateError('Encrypted directory has contents but no gocryptfs.conf. Refusing to overwrite it.')
-    prompt = 'Choose password for NEW encrypted home: ' if new else 'Encrypted home password: '
-    password = getpass.getpass(prompt)
-    if not password:
-        raise PrivateError('Empty passwords are not supported')
-    if new and password != getpass.getpass('Repeat new password: '):
-        raise PrivateError('Password confirmation does not match')
-    cmd = gocryptfs_cmd()
-    if new:
-        info('Initializing a NEW encrypted vault. Existing vaults are never reset.')
-        init = passfile_call([*cmd, '-init', str(CIPHER)], password)
-        if init.returncode:
-            raise PrivateError('Vault initialization failed:\n' + init.stdout[-2000:])
-        # The initialization output may contain a recovery master key; show it
-        # only on the terminal, never save it to an unencrypted file.
-        if init.stdout.strip():
-            print('\nSAVE THESE NEW-VAULT RECOVERY DETAILS SECURELY:\n' + init.stdout + '\n', flush=True)
-    logpath = STATE / 'gocryptfs.log'
-    with logpath.open('ab') as log:
-        os.chmod(logpath, 0o600)
-        child = passfile_call([*cmd, '-fg', str(CIPHER), str(MOUNT)], password,
-                              background=True, log=log)
-    deadline = time.monotonic() + 30
-    while not mounted():
-        if child.poll() is not None:
-            raise PrivateError(f'gocryptfs mount failed (exit {child.returncode}); see {logpath}')
-        if time.monotonic() >= deadline:
-            child.terminate()
-            raise PrivateError(f'gocryptfs mount timed out; see {logpath}')
-        time.sleep(.15)
-    if child.poll() is not None:
-        raise PrivateError(f'gocryptfs stopped unexpectedly; see {logpath}')
-    prepare_decrypted_directories()
-    return child
-
-
-class TerminalSession:
-    def __init__(self, script):
-        self.script = script
-        self.procs = {}
-        self.children_lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.closing = threading.Event()
-        self.server = None
-        self.server_thread = None
-        self.fuse = None
-        self.watchdog = None
-        self.watchdog_pipe = None
-
-    def save_pids_locked(self):
-        rows = [{'pid': p.pid, 'start': start_ticks(p.pid)}
-                for p in self.procs.values() if p.poll() is None]
-        rows = [p for p in rows if p['start'] is not None]
-        atomic_write(PIDS, json.dumps(rows), 0o600)
-
-    def spawn(self, cmd):
-        with self.children_lock:
-            if self.closing.is_set() or not mounted():
-                raise PrivateError('Private home is shutting down or unavailable')
-            child = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                     start_new_session=True, close_fds=True)
-            self.procs[child.pid] = child
-            self.save_pids_locked()
-
-    def serve(self):
-        while not self.closing.is_set():
-            try:
-                conn, _ = self.server.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            with conn:
-                conn.settimeout(5)
-                try:
-                    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-                    _pid, peer_uid, _gid = struct.unpack('3i', creds)
-                    if peer_uid != os.getuid():
-                        raise PrivateError('Unauthorized launcher request')
-                    line = bytearray()
-                    while b'\n' not in line and len(line) < 65536:
-                        block = conn.recv(4096)
-                        if not block:
-                            break
-                        line.extend(block)
-                    data = json.loads(bytes(line).split(b'\n')[0])
-                    ident = data.get('id')
-                    args = data.get('args', [])
-                    if (not isinstance(args, list) or len(args) > 100 or
-                            not all(isinstance(v, str) and len(v) <= 8192 for v in args)):
-                        raise PrivateError('Invalid launcher arguments')
-                    cmd = active_launch_by_id(ident, args)
-                    self.spawn(cmd)
-                    answer = {'ok': True}
-                except Exception as e:
-                    answer = {'ok': False, 'error': str(e)}
-                    info('Private launcher error: ' + str(e))
-                try:
-                    conn.sendall((json.dumps(answer) + '\n').encode())
-                except OSError:
-                    pass
-
-    def start_server(self):
-        # This socket belongs to us only while the global lock is held.
-        IPC.unlink(missing_ok=True)
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(IPC))
-        os.chmod(IPC, 0o600)
-        server.listen(16)
-        server.settimeout(.5)
-        self.server = server
-        self.server_thread = threading.Thread(target=self.serve, daemon=True)
-        self.server_thread.start()
-
-    def start_watchdog(self):
-        reader, writer = os.pipe()
-        log = WATCHDOG_LOG.open('ab')
-        os.chmod(WATCHDOG_LOG, 0o600)
-        try:
-            self.watchdog = subprocess.Popen(
-                [sys.executable, str(self.script), '--watchdog', str(reader)],
-                pass_fds=(reader,), close_fds=True, start_new_session=True,
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-            self.watchdog_pipe = writer
-            writer = -1
-        finally:
-            log.close()
-            os.close(reader)
-            if writer != -1:
-                os.close(writer)
-
-    def refresh_pids(self):
-        with self.children_lock:
-            for pid, child in list(self.procs.items()):
-                if child.poll() is not None:
-                    self.procs.pop(pid, None)
-            self.save_pids_locked()
-
-    def close_server(self):
-        self.closing.set()
-        if self.server:
-            self.server.close()
-        if self.server_thread:
-            self.server_thread.join(timeout=3)
-        IPC.unlink(missing_ok=True)
-
-    def cleanup(self):
-        self.close_server()
-        errors = []
-        # Remove launchers FIRST so nothing new can be started during teardown.
-        try:
-            remove_generated_launchers()
-        except Exception as e:
-            errors.append('Removing launchers: ' + str(e))
-        try:
-            stop_private_apps()
-            unmount_private()
-        except Exception as e:
-            errors.append('Unmounting: ' + str(e))
-        if not mounted():
-            PIDS.unlink(missing_ok=True)
-            FUSE_PID.unlink(missing_ok=True)
-            if self.fuse and self.fuse.poll() is None:
-                self.fuse.terminate()
-                try:
-                    self.fuse.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self.fuse.kill()
-            self.fuse = None
-            info('Private home locked; (Private) launchers removed.')
-        else:
-            info('WARNING: decrypted home remains mounted!')
-        # Watchdog should run its own attempt if cleanup failed.
-        if self.watchdog_pipe is not None:
-            try:
-                if not errors and not mounted():
-                    os.write(self.watchdog_pipe, b'CLEAN\n')
-            except OSError:
-                pass
-            os.close(self.watchdog_pipe)
-            self.watchdog_pipe = None
-        if errors:
-            raise PrivateError('; '.join(errors))
-
-
-def watchdog_main(read_fd):
-    # A separate process running this SAME FILE survives SIGKILL of the parent.
-    # No password or plaintext files are given to it, only a pipe for liveness.
-    try:
-        complete = b''
-        while True:
-            data = os.read(read_fd, 128)
-            if not data:
-                break
-            complete += data
-        if complete == b'CLEAN\n':
-            return 0
-        mkdir_private(STATE)
-        with LOCK.open('a+b') as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                # Another live instance owns the lock and is responsible for
-                # recovery. Never kill a newer session's applications.
-                return 0
-            info('Main process ended unexpectedly; watchdog starting cleanup.')
-            IPC.unlink(missing_ok=True)
-            remove_generated_launchers()
-            stop_private_apps()
-            unmount_private(retries=16)
-            if not mounted():
-                PIDS.unlink(missing_ok=True)
-                try:
-                    fuse = json.loads(FUSE_PID.read_text())
-                    pid, ticks = int(fuse['pid']), fuse['start']
-                    if ticks is not None and start_ticks(pid) == ticks:
-                        os.kill(pid, signal.SIGTERM)
-                except (OSError, ValueError, TypeError, KeyError, ProcessLookupError):
-                    pass
-                FUSE_PID.unlink(missing_ok=True)
-                info('Watchdog cleanup completed.')
-        return 0
-    except Exception as e:
-        info('WATCHDOG CLEANUP INCOMPLETE: ' + str(e))
-        return 2
-    finally:
-        os.close(read_fd)
-
-
-def recover_previous_mount():
-    # A killed previous invocation could have left a gocryptfs mount and stale
-    # launchers. The lock assures no other copy of this controller is live.
-    remove_generated_launchers()
-    if mounted():
-        if not FUSE_PID.is_file():
-            raise PrivateError('The encrypted home is already mounted by an unknown or older '
-                               'controller. Exit that controller and unmount it first; '
-                               'refusing to interrupt another private desktop.')
-        info('Found a previous terminal-controller mount; recovering before unlocking.')
-        stop_private_apps()
-        unmount_private(retries=16)
-    PIDS.unlink(missing_ok=True)
-    FUSE_PID.unlink(missing_ok=True)
-    IPC.unlink(missing_ok=True)
-
-
-def setup_dependencies():
-    if not LOADER.is_file():
-        raise PrivateError(f'Steam Frame ARM64 loader is missing: {LOADER}')
-    # No Qt, PyQt, Tk, or XWayland plugin installations required.
-    ensure_bwrap()
-    ensure_native_gocryptfs()
-    ensure_fuse_helper()
-
-
-def parse_resolution(spec):
-    spec = (spec or '').strip().lower()
-    if spec in ('', 'keep', 'none', 'off', 'native'):
-        return None
-    match = re.fullmatch(r'(\d{2,5})x(\d{2,5})', spec)
-    if not match:
-        raise PrivateError('--resolution expects WxH like 1920x1080, or "keep"')
-    return int(match.group(1)), int(match.group(2))
-
-
-def _active_mode_is(ksd, width, height):
-    try:
-        listing = subprocess.run([ksd, '-o'], stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, timeout=15).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return ''
-    if re.search(rf'{width}x{height}@[\d.]+\*', listing):
-        return f'{width}x{height}'
-    if listing:
-        current = re.findall(r'(\d{2,5}x\d{2,5})@[\d.]+\*', listing)
-        if current:
-            return current[0]
-    return ''
-
-
-def apply_resolution(width, height):
-    """Best-effort resize of the nested Plasma output via KScreen (kscreen-doctor).
-
-    This changes the resolution of the desktop UI that the Frame shows on its
-    virtual screen. Never fatal: a session KScreen cannot resize keeps its
-    current mode and the private desktop still works.
-    """
-    ksd = shutil.which('kscreen-doctor')
-    if not ksd:
-        info('Resolution: kscreen-doctor not found; keeping the current desktop resolution.')
-        return
-    current = _active_mode_is(ksd, width, height)
-    if current == f'{width}x{height}':
-        info(f'Desktop already at {width}x{height}.')
-        return
-    try:
-        listing = subprocess.run([ksd, '-o'], stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, timeout=15).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        listing = ''
-    outputs = sorted(set(re.findall(r'(?<![A-Za-z0-9])([A-Za-z]+-[A-Za-z0-9.]+)(?![\w-])', listing)))
-    scopes = ['all'] + outputs[:6]
-    target = f'{width}x{height}'
-    for scope in scopes:
-        for mode in (target, f'{target}@60', f'{target}@60.00'):
-            try:
-                r = subprocess.run([ksd, f'output.{scope}.mode.{mode}'],
-                                   stdin=subprocess.DEVNULL, capture_output=True,
-                                   text=True, timeout=20)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if r.returncode == 0 and _active_mode_is(ksd, width, height) == target:
-                info(f'Desktop resolution set to {target} (output {scope}).')
-                return
-    info(f'Could not switch the desktop to {target} (currently {current or "unknown"}); '
-         'keeping the existing resolution. Try again, use --resolution WxH, '
-         'or run kscreen-doctor manually in Konsole.')
-
-
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--launch', nargs='+', metavar='ID_OR_URI',
-                        help=argparse.SUPPRESS)
-    parser.add_argument('--watchdog', type=int, help=argparse.SUPPRESS)
-    parser.add_argument('--resolution', default=os.environ.get('FRAME_PRIVATE_RESOLUTION',
-                                                               DEFAULT_RESOLUTION),
-                        metavar='WxH', help='Desktop resolution applied on unlock '
-                        f'(default: {DEFAULT_RESOLUTION}; "keep" leaves it untouched)')
-    parser.add_argument('--install-launcher', action='store_true',
-                        help='Install the Frame "+" menu entry (Konsole wrapper + .desktop) and exit')
-    parser.add_argument('--remove-launcher', action='store_true',
-                        help='Remove the installed Frame "+" menu entry and exit')
+    parser.add_argument("--width", type=int, default=1920)
+    parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument("--install-launcher", "--make-launcher", dest="install_launcher",
+                        action="store_true",
+                        help="Install the Frame '+' menu entry (Konsole wrapper + .desktop) and exit")
+    parser.add_argument("--remove-launcher", action="store_true",
+                        help="Remove the installed Frame '+' menu entry and exit")
+    clipboard = parser.add_mutually_exclusive_group()
+    clipboard.add_argument("--share-clipboard", dest="share_clipboard", action="store_true", default=True,
+                           help="Enable bidirectional TEXT clipboard sync (the default)")
+    clipboard.add_argument("--no-share-clipboard", dest="share_clipboard", action="store_false",
+                           help="Disable clipboard sharing to keep private clipboard data off the host")
+    parser.add_argument("--reset-empty-vault", action="store_true",
+                        help="Archive and reinitialize an EMPTY vault; don't use routinely")
     args = parser.parse_args()
+    if not (640 <= args.width <= 8192 and 480 <= args.height <= 8192):
+        parser.error("Window dimensions must be between 640x480 and 8192x8192")
+    if os.geteuid() == 0:
+        raise LaunchError("Run as steamos, not root")
     os.umask(0o077)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    if os.geteuid() == 0:
-        raise PrivateError('Never run the private-home controller as root')
-    if args.launch:
-        send_request(args.launch[0], args.launch[1:])
-        return 0
-    if args.watchdog is not None:
-        return watchdog_main(args.watchdog)
+
+    home = Path.home().resolve()
     if args.install_launcher:
-        install_menu_entry()
+        install_menu_entry(args.share_clipboard)
         return 0
     if args.remove_launcher:
         remove_menu_entry()
         return 0
-    resolution = parse_resolution(args.resolution)
     if not sys.stdin.isatty():
-        raise PrivateError('Start this controller from a real terminal (Konsole).')
-    script = Path(__file__).resolve()
-    mkdir_private(STATE)
-    # Exclusive flock, held until mount is removed.
-    with LOCK.open('a+b') as lock:
+        raise LaunchError("Launch from a terminal so the passphrase can be entered securely")
+
+    runtime_base, wayland_socket = find_outer_wayland()
+    state = home / REL_STATE
+    state.mkdir(parents=True, exist_ok=True)
+    state.chmod(0o700)
+    lock_file = state / "session.lock"
+    with lock_file.open("a+b") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise PrivateError('A private-home controller is already running')
-        disable_old_gui_autostart()
-        recover_previous_mount()
-        setup_dependencies()
-        app = TerminalSession(script)
-        ready = False
+        except BlockingIOError as exc:
+            raise LaunchError("A private session launcher is already running") from exc
 
-        def handle_signal(signum, _frame):
-            if not ready:
-                raise KeyboardInterrupt
-            info(f'Received {signal.Signals(signum).name}; locking...')
-            app.stop_event.set()
+        cipher = state / "encrypted"
+        cipher.mkdir(parents=True, exist_ok=True)
+        cipher.chmod(0o700)
+        # Prefer the writable ext4 filesystem where manual -fg FUSE testing
+        # succeeded, rather than the /run/user tmpfs that has not been tested.
+        mount = state / "mount"
+        mount.mkdir(parents=True, exist_ok=True)
+        mount.chmod(0o700)
+        if os.path.ismount(mount):
+            raise LaunchError(f"A previous decrypted mount is already active: {mount}; refusing to proceed")
+        if any(mount.iterdir()):
+            raise LaunchError(f"Mountpoint isn't empty: {mount}")
 
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-            signal.signal(signum, handle_signal)
+        if args.reset_empty_vault:
+            ensure_empty_vault_reset(cipher)
+        clipboard_bin = ensure_clipboard_tools() if args.share_clipboard else None
+        binary = ensure_native_gocryptfs(home)
+        command("bwrap")
+        command("startplasma-wayland")
+        command("kwin_wayland")
+        command("dbus-run-session")
+        ensure_host_fusermount_alias()
+
+        if not (cipher / "gocryptfs.conf").is_file():
+            if any(cipher.iterdir()):
+                raise LaunchError("Cipher directory is nonempty but lacks gocryptfs.conf")
+            info("First run: initialize your encrypted vault. Save the master key OFF the headset.")
+            run(host_gocryptfs(binary) + ["-init", str(cipher)])
+        else:
+            info("Existing encrypted vault found. Enter your passphrase to unlock.")
+
+        fuse_child = None
+        mounted = False
         try:
-            app.start_watchdog()
-            info('Unlocking private home. Ctrl+C (or kill -TERM) will lock it.')
-            app.fuse = unlock_home()
-            atomic_write(FUSE_PID, json.dumps({'pid': app.fuse.pid,
-                                               'start': start_ticks(app.fuse.pid)}), 0o600)
-            if resolution:
-                # Runs in the host Plasma session (needs its D-Bus), never inside the
-                # app sandbox; a failure here must not abort the unlock.
-                try:
-                    apply_resolution(*resolution)
-                except Exception as e:
-                    info('Resolution adjustment failed: ' + str(e))
-            app.start_server()
-            count = make_launchers(script)
-            info(f'Unlocked; {count} (Private) launchers are available in your KDE menu.')
-            info('Leave this terminal running. Press Ctrl+C to lock and quit.')
-            ready = True
-            while not app.stop_event.wait(.5):
-                app.refresh_pids()
+            fuse_child = mount_foreground(binary, cipher, mount)
+            mounted = True
+            for rel in (".config", ".cache", ".local/share", ".local/state", "Documents", "Downloads"):
+                (mount / rel).mkdir(parents=True, exist_ok=True)
+            ensure_classic_plasma_startup(mount)
+            kwin_wrapper(mount, args.width, args.height)
+            # Protect the private Flatpak installation against accidental
+            # symlinks back into /host-home (regular SteamOS user's data).
+            for rel in (".local/share/flatpak", ".var"):
+                private_location = mount / rel
+                if private_location.is_symlink():
+                    raise LaunchError(f"Private Flatpak path must not be a symlink: {private_location}")
+                private_location.mkdir(parents=True, exist_ok=True)
+            if args.share_clipboard:
+                write_clipboard_bridge(mount)
+                info("WARNING: Bidirectional text clipboard can expose passwords to unencrypted KDE clipboard history.")
+            prepare_flatpak_bootstrap(mount, share_clipboard=args.share_clipboard)
+            info("Unlocked. Starting KDE; host SYSTEM Flatpaks are read-only, user Flatpaks are private, /host-home is available.")
+            cmd = build_private_kde(home, mount, wayland_socket, runtime_base, args.width, args.height, clipboard_bin)
+            return run_session(cmd)
         finally:
-            # SIGTERM or further Ctrl+C during teardown must not interrupt
-            # the unmount and leave a false impression that the vault locked.
-            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-                signal.signal(signum, signal.SIG_IGN)
-            info('Closing private apps, removing launchers and unmounting...')
-            app.cleanup()
-    return 0
+            if mounted or os.path.ismount(mount):
+                unmount(mount)
+            if fuse_child is not None:
+                stop_foreground(fuse_child)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     try:
         sys.exit(main())
-    except KeyboardInterrupt:
-        print('\nInterrupted.', file=sys.stderr)
-        sys.exit(130)
-    except (OSError, PrivateError, RuntimeError, subprocess.SubprocessError) as e:
-        print(f'{APP}: {e}', file=sys.stderr, flush=True)
+    except (LaunchError, subprocess.CalledProcessError, OSError) as exc:
+        print(f"[{APP}] ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"[{APP}] Interrupted", file=sys.stderr)
+        sys.exit(130)

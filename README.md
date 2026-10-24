@@ -1,46 +1,47 @@
-# Frame Private Desktop
+# Steam Frame Private Desktop
 
-A one-file controller that gives your **Steam Frame** (or any SteamOS KDE
-Wayland session) a **gocryptfs-encrypted private home** plus a set of
-**"(Private)" application launchers** in the KDE menu. While unlocked, your
-normal KDE/Plasma session is untouched; apps started through the (Private)
-launchers run in their own Bubblewrap namespaces where `HOME` is the decrypted
-vault instead of your real home. Lock it again with `Ctrl+C` and every private
-app is stopped, the launchers disappear, and the vault unmounts.
+Unlock a **gocryptfs-encrypted private home** on your **Steam Frame** and
+launch a **nested KDE Plasma desktop** inside it. The private desktop runs in
+its own Bubblewrap namespace with the decrypted vault mounted over `HOME`, so
+apps installed into the private session (Flatpak `--user`, Guix profile,
+Konsole, Firefox, …) keep their data inside the encrypted vault. When the
+session ends, the vault unmounts and nothing plaintext is left on disk.
 
 ## How it works
 
-- **Unlock** — you enter a passphrase in the terminal; `gocryptfs` mounts the
-  encrypted vault (created under `~/.local/share/frame-private-desktop/`) at a
-  private mount point using the SteamOS ARM64 loader plus a Guix-built
-  `gocryptfs` binary.
-- **Launchers** — the controller scans system, Guix-profile, and private-home
-  `.desktop` entries and regenerates matching `frame-private-app-*.desktop`
-  entries in `~/.local/share/applications` whose names get a ` (Private)`
-  suffix. Launching one sends an authenticated request (peer-UID-checked Unix
-  socket) to the still-running controller.
-- **Sandbox** — each private app runs under `bwrap` with the decrypted vault
-  bind-mounted over `HOME`. The Guix store at `~/.local/share/guix` is mounted
-  at `/gnu/store`; host Wayland, D-Bus, and PipeWire/Pulse sockets are passed
-  through so apps appear on your desktop normally. The host user's real home is
-  *not* visible inside the sandbox.
-- **Lock** — `Ctrl+C` / `SIGTERM` stops recorded process groups (verified by
-  PID start-time to avoid recycled-PID mistakes), removes the generated
-  launchers, refreshes the KDE menu cache, and unmounts via the host
-  `fusermount3` after verifying the mount really is gocryptfs.
-- **Crash safety** — a watchdog running the *same script file* survives a
-  `SIGKILL` of the controller and performs the same teardown.
+- **Unlock** — enter your passphrase in the terminal; `gocryptfs` mounts the
+  vault at `~/.local/share/frame-private-desktop/mount/` using the SteamOS
+  ARM64 loader plus a Guix-built `gocryptfs` binary (`-fg`, never the
+  relocatable Guix pack wrapper).
+- **Nested KDE** — a `bwrap` namespace is built (fresh `/run`, `--unshare-pid`,
+  private D-Bus via `dbus-run-session`) with the vault bind-mounted over
+  `HOME` and the rootless Guix store at `/gnu/store`. A `kwin_wayland_wrapper`
+  shim sets the nested display size (**1920×1080 by default**), then
+  `startplasma-wayland` brings up a full Plasma session composited onto your
+  host desktop's Wayland socket — it appears on the Frame's virtual screen.
+- **Real home** — your normal home is visible inside the namespace as
+  `/host-home`; the private `~/.local/share/flatpak` is checked so it can never
+  accidentally symlink to it. Host **system** Flatpaks (`/var/lib/flatpak`) are
+  shared read-only; your private `flatpak --user` install (with its own Flathub
+  remote) lives encrypted in the vault.
+- **Clipboard** — bidirectional *text* clipboard sync between host and private
+  desktop using `wl-clipboard` ≥ 2.3 (SteamOS's copy is used when new enough,
+  otherwise Guix's). Disable with `--no-share-clipboard`.
+- **Lock** — `Ctrl+C` in the Konsole window stops the session, unmounts via
+  `fusermount3 -u` (with retries), and refuses to pretend success if anything
+  still holds the mount. `SIGTERM` is treated the same way.
 
 ## Requirements
 
-- A **Steam Frame** running SteamOS (aarch64) inside its nested KDE Plasma
-  Wayland session, or a comparable SteamOS KDE session.
+- A **Steam Frame** running SteamOS (aarch64), launched from inside its nested
+  KDE desktop (Konsole), not a plain SSH shell.
 - **[guix-rootless](https://github.com/directrix1/guix-rootless)** — the
   companion rootless GNU Guix installer. It provides `~/.local/bin/guix-env`
-  and the rootless store at `~/.local/share/guix`. This script uses it to
-  install and run `gocryptfs` and `bubblewrap` without touching the host
-  system. Install that project first.
-- **Konsole** (for the terminal controller) and a normal interactive login.
+  and the store at `~/.local/share/guix`; this tool uses it to install
+  `gocryptfs` and (if needed) `wl-clipboard`. Install that project first.
+- Host packages already present on SteamOS: `bwrap`, `kwin_wayland`,
+  `kwin_wayland_wrapper`, `startplasma-wayland`, `dbus-run-session`,
+  `fusermount3` (setuid), Konsole.
 - `sudo` is asked for *once per boot*, only to create the
   `/run/setuid-programs/fusermount3` alias that Guix's FUSE mount expects.
 
@@ -66,62 +67,72 @@ cd steam_frame_private_desktop
 
 | File | Purpose |
 | --- | --- |
-| `~/.local/bin/frame-private-desktop-launch` | Opens the controller in a Konsole window |
-| `~/.local/share/applications/frame-private-desktop.desktop` | The `Private Desktop` entry, discoverable by the Frame `+` menu / "Add Library Shortcut" |
+| `~/.local/bin/frame-private-desktop-launch` | Opens the session in a Konsole window (needed for the passphrase prompt) |
+| `~/.local/share/applications/frame-private-desktop.desktop` | The `Private Desktop` entry for the Frame `+` menu / "Add Library Shortcut" |
 
 The `Exec` line is a single space-free absolute path, as the SteamOS non-Steam
-scanner requires. Undo anytime with
-`./frame_private_desktop.py --remove-launcher`.
+scanner requires. Add `--no-share-clipboard` at install time to bake clipboard
+sharing off into the wrapper. Undo anytime with
+`./frame_private_desktop.py --remove-launcher` (`--make-launcher` is accepted
+as a legacy alias for `--install-launcher`).
 
 ## Use
 
 1. On the Frame, press **+** and choose **Private Desktop** (or run the script
-   in Konsole yourself). The terminal asks for your vault password — on first
-   run it creates a new vault and prints a **recovery key: save it somewhere
-   safe, it is never written to disk unencrypted**.
-2. After unlock, the KDE menu fills with `… (Private)` launchers. Apps started
-   from them see only the encrypted private home.
-3. The desktop is resized to **1920×1080** on unlock by default (see
-   [Resolution](#resolution)).
-4. Leave the Konsole window open. Press `Ctrl+C` (or `kill -TERM`) to close
-   private apps, remove the `(Private)` launchers, and lock the vault. The
-   terminal prints a warning and refuses to pretend success if unmount fails.
+   in Konsole yourself). First run initializes a new vault — **save the
+   printed master key somewhere off the headset**.
+2. Enter your passphrase; the nested Plasma desktop appears on the Frame's
+   virtual screen at **1920×1080**. Install apps inside it as normal (Discover
+   with the private Flathub, `guix-env`/`guix-pkg` from a private Konsole, …).
+3. Leave the Konsole window open. Press `Ctrl+C` (or `kill -TERM` the script)
+   to end the session and lock the vault.
 
-## Resolution
+## Display size
 
-The Frame shows the desktop on a virtual screen; the effective menu/desktop
-resolution comes from the nested Plasma session. On unlock the controller runs
-KScreen (`kscreen-doctor`) to switch the session output to `1920x1080`:
+The nested desktop defaults to `1920x1080`:
 
 ```bash
-./frame_private_desktop.py                    # default: 1920x1080
-./frame_private_desktop.py --resolution 2560x1440
-./frame_private_desktop.py --resolution keep  # leave the desktop alone
+./frame_private_desktop.py                    # 1920x1080
+./frame_private_desktop.py --width 2560 --height 1440
 ```
 
-`FRAME_PRIVATE_RESOLUTION` does the same thing via the environment. This is
-best-effort: if KScreen reports no usable mode (some nested backends only
-offer the window size), the current resolution is kept and the message is
-logged. You can always resize manually in Konsole with `kscreen-doctor -o` to
-inspect and `kscreen-doctor output.<name>.mode.<WxH>` to try a mode.
+Any size from 640×480 up to 8192×8192 is accepted. The size is applied to the
+nested KWin output; the Frame scales that image onto your virtual screen, so
+1080p gives crisp desktop/UI rendering in the headset.
+
+## Command line
+
+```
+--width W / --height H        Nested display size (default 1920x1080)
+--install-launcher            Install the Frame '+' menu entry and exit
+--remove-launcher             Remove it and exit
+--share-clipboard             Bidirectional text clipboard sync (default)
+--no-share-clipboard          Keep private clipboard data off the host
+--reset-empty-vault           Archive and reinitialize a vault that contains
+                              nothing but its config (refuses if it has data)
+```
 
 ## Security model (read this)
 
-- **Encryption at rest only.** While unlocked, your normal login user can read
-  the plaintext mount, and private apps share host services (GPU, audio,
-  Wayland, D-Bus, network). Single-instance apps may forward work into an
-  already-running host process. This keeps other users and stolen devices out,
-  not your own login session.
-- The vault at `~/.local/share/frame-private-desktop/encrypted/` is **never**
-  reset or overwritten; a vault directory without `gocryptfs.conf` is refused,
-  never initialized over.
-- Passphrases travel only through an inherited anonymous pipe
-  (`-passfile /proc/self/fd/N`) — never argv, environment, or disk. Core dumps
-  are disabled (`RLIMIT_CORE=0`) and `SIGQUIT` is trapped so it cannot dump
-  core during teardown.
-- Everything the controller owns lives under mode `0700`/`0600` paths and only
-  files with the `frame-private-app-*` prefix (or the exact
-  `frame-private-desktop.desktop` name) are ever modified or removed.
+- **Encryption at rest only.** While unlocked, any process running as your
+  login user can read the plaintext mount at
+  `~/.local/share/frame-private-desktop/mount/`. The bwrap namespace is
+  *convenience scoping*, not a hardened sandbox — it shares the network, GPU,
+  and your host Wayland compositor. **Never suspend or power off the headset
+  while the session is unlocked.**
+- Clipboard sync is text-only but genuinely two-way: passwords copied inside
+  the private desktop land in the host clipboard history. Use
+  `--no-share-clipboard` if that matters.
+- `/host-home` is deliberately bind-mounted so you can move files across;
+  remove that bind in `build_private_kde()` if you want stricter separation.
+- Passphrases are entered interactively by `gocryptfs` on the terminal — they
+  never pass through argv, environment, or logs. Core dumps are disabled
+  (`RLIMIT_CORE=0`) and `SIGQUIT` (which core-dumps) is neutralized.
+- The vault is never overwritten: a non-empty cipher directory without
+  `gocryptfs.conf` aborts with an error instead of re-initializing.
+- `/usr/bin/fusermount3` is verified setuid, and the `/run/setuid-programs`
+  alias is created only against that exact trusted binary — an unexpected
+  existing path is refused, never replaced.
 
 ## State and files
 
@@ -129,28 +140,25 @@ inspect and `kscreen-doctor output.<name>.mode.<WxH>` to try a mode.
 | --- | --- |
 | `~/.local/share/frame-private-desktop/encrypted/` | gocryptfs vault (ciphertext) |
 | `~/.local/share/frame-private-desktop/mount/` | plaintext mount (only while unlocked) |
-| `~/.local/share/frame-private-desktop/terminal-app-pids.json` | live private-app process groups |
-| `~/.local/share/frame-private-desktop/tray.sock` | controller IPC socket (peer-UID checked) |
-| `~/.local/share/frame-private-desktop/tray.lock` | single-instance `flock` |
-| `~/.local/bin/gocryptfs-native` | Guix `gocryptfs` ELF copy run via `/lib/ld-linux-aarch64.so.1` |
+| `~/.local/share/frame-private-desktop/session.lock` | single-instance `flock` |
+| `~/.local/share/frame-private-desktop/bin/` | in-vault startup shim (`private-plasma-start`, kwin wrappers, clipboard bridge) |
+| `~/.local/bin/gocryptfs-native` | Guix `gocryptfs` ELF run via `/lib/ld-linux-aarch64.so.1` |
 
 ## Troubleshooting
 
-- **"guix-env not found under ~/.local/bin"** — install
-  [guix-rootless](https://github.com/directrix1/guix-rootless) first; this
-  script shells out to it for `gocryptfs`/`bubblewrap`.
-- **"FUSE helper alias missing"** — run the script from an interactive
-  terminal once so `sudo` can create `/run/setuid-programs/fusermount3`.
-- **"already mounted by an unknown controller"** — an older/other controller
-  instance holds the vault; let it exit (it cleans up) instead of unmounting
-  by hand.
-- **Menu entry invisible on the Frame** — KDE caches menus (`kbuildsycoca6` is
-  run for you); also try copying
-  `~/.local/share/applications/frame-private-desktop.desktop` to `~/Desktop`,
-  another directory the SteamOS scanner reads.
-- **"STILL MOUNTED" on lock** — something still uses the mount (often a file
-  manager); close it and `Ctrl+C` again. Never suspend believing it is locked
-  when the warning appears.
+- **"guix-env was not found"** — install
+  [guix-rootless](https://github.com/directrix1/guix-rootless) first.
+- **"Launch from a terminal"** — the passphrase needs a real TTY; use Konsole,
+  not a bare SSH session (or use the `+` menu entry, which opens Konsole).
+- **"A previous decrypted mount is already active"** — a crashed run left the
+  mount; check nothing is using it, then `fusermount3 -u ~/.local/share/frame-private-desktop/mount`.
+- **"STILL MOUNTED" on exit** — close apps/terminals inside the private desktop
+  and exit again. Do not leave the headset unattended until it locks.
+- **Clipboard errors** — needs `wl-clipboard` ≥ 2.3; the tool installs the Guix
+  copy automatically, or start with `--no-share-clipboard`.
+- **Menu entry invisible on the Frame** — `kbuildsycoca6` runs for you; also
+  try copying `~/.local/share/applications/frame-private-desktop.desktop` into
+  `~/Desktop`, another directory the SteamOS scanner reads.
 
 ## License
 
