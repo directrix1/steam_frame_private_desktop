@@ -230,7 +230,19 @@ def kwin_wrapper(mount: Path, width: int, height: int) -> None:
     wrapper = bin_dir / "kwin_wayland_wrapper"
     wrapper.write_text(
         '#!/bin/sh\n'
-        f'exec /usr/bin/kwin_wayland_wrapper --width {width} --height {height} --no-lockscreen "$@"\n',
+        '# Supervise SteamOS\' wrapper: its exit code 120 only means "gave up\n'
+        '# respawning KWin"; log every death with a timestamp so launch.log shows\n'
+        '# how often and when KWin actually died, and retry a few times before\n'
+        '# letting the private session end.\n'
+        'i=1\n'
+        'while [ "$i" -le 3 ]; do\n'
+        f'    /usr/bin/kwin_wayland_wrapper --width {width} --height {height} --no-lockscreen "$@"\n'
+        '    rc=$?\n'
+        '    printf \'[frame-kwin] compositor attempt %s exited rc=%s at %s\\n\' "$i" "$rc" "$(date +%H:%M:%S)" >&2\n'
+        '    [ "$rc" -eq 0 ] && exit 0\n'
+        '    i=$((i + 1)); sleep 2\n'
+        'done\n'
+        'exit 120\n',
         encoding="utf-8",
     )
     wrapper.chmod(0o700)
@@ -611,7 +623,7 @@ def build_private_kde(home: Path, mount: Path, wayland_socket: Path, runtime_bas
 def run_session(args: list[str]) -> int:
     child = subprocess.Popen(args, start_new_session=True)
     try:
-        return child.wait()
+        status = child.wait()
     except KeyboardInterrupt:
         info("Stopping the private KDE session ...")
         try:
@@ -624,6 +636,19 @@ def run_session(args: list[str]) -> int:
             os.killpg(child.pid, signal.SIGKILL)
             child.wait()
             return 130
+    # The SteamOS kwin_wayland_wrapper respawns a dead KWin and reports its own
+    # code once it gives up (KWIN_RESTART_COUNT); 120 there means KWin kept
+    # dying. Log who really ended the session so launch.log self-identifies it.
+    if status < 0:
+        name = signal.Signals(-status).name
+        info(f"Private session was killed by signal {name} (-{status}); "
+             "an external process (Steam session cleanup, OOM killer) sent it.")
+    elif status == 120:
+        info("Private session exited 120: SteamOS' kwin_wayland_wrapper gave up "
+             "respawning KWin (KWin exited repeatedly). See messages above.")
+    else:
+        info(f"Private session exited with code {status}.")
+    return status
 
 
 def mount_foreground(binary: Path, cipher: Path, mount: Path) -> subprocess.Popen:

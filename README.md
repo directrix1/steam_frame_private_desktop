@@ -147,6 +147,13 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
 
 ## Troubleshooting
 
+- **No `sudo` password prompt from the `+` menu** — expected: the FUSE helper
+  alias under `/run/setuid-programs` is created once per boot, so only the
+  first launch after each reboot asks for your login password.
+- **`rc=120` in `launch.log`** — that code comes from SteamOS'
+  `kwin_wayland_wrapper` after it stops respawning a dying KWin. The
+  controller now labels what ended the session (exit code, fatal signal, or
+  repeated KWin deaths with timestamps via the supervised compositor shim).
 - **Vault unlocks but no desktop appears (or anything from a `+`-menu launch)**
   — read `~/.local/share/frame-private-desktop/launch.log`: every menu launch
   appends the controller's *and* the nested Plasma session's complete output
