@@ -44,6 +44,16 @@ app is stopped, the launchers disappear, and the vault unmounts.
 - `sudo` is asked for *once per boot*, only to create the
   `/run/setuid-programs/fusermount3` alias that Guix's FUSE mount expects.
 
+## Quick install (one-liner)
+
+Already have [guix-rootless](https://github.com/directrix1/guix-rootless)
+installed? Run this in a Konsole terminal on the Frame to clone the repo and
+install the `+` menu entry in one go:
+
+```bash
+git clone https://github.com/directrix1/steam_frame_private_desktop.git ~/steam_frame_private_desktop && ~/steam_frame_private_desktop/frame_private_desktop.py --install-launcher
+```
+
 ## Install
 
 ```bash
