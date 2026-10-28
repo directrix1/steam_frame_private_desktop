@@ -182,15 +182,45 @@ def start_desktop_session(steam_socket: Path) -> Path | None:
            "XDG_RUNTIME_DIR": str(steam_socket.parent),
            "XDG_SESSION_TYPE": "wayland",
            "WAYLAND_DISPLAY": steam_socket.name}
-    try:
-        with log_path.open("ab") as log:
-            subprocess.Popen([str(launcher)], stdin=subprocess.DEVNULL,
-                             stdout=log, stderr=log, env=env,
-                             start_new_session=True)
-    except OSError as exc:
-        info(f"Could not start the built-in desktop session ({exc}); "
-             "falling back to Steam's compositor.")
-        return None
+    # A '+'-menu Konsole lives inside steam.service's cgroup, and children
+    # inherit it: the first auto-started desktop was SIGTERMed by Steam's
+    # teardown of the desktop the user had just closed, seconds after it
+    # came up. systemd-run --user places the session under the user manager
+    # instead - the same neighbourhood Steam's own session lives in - so
+    # Steam's process-tree cleanup cannot reach it.
+    launched = False
+    if shutil.which("systemd-run"):
+        bus = steam_socket.parent / "bus"
+        argv = ["systemd-run", "--user", "--quiet", "--collect",
+                f"--unit=frame-private-desktop-nested-{os.getpid()}",
+                f"--property=StandardOutput=append:{log_path}",
+                f"--property=StandardError=append:{log_path}"]
+        argv += [f"--setenv={key}={value}" for key, value in env.items()]
+        argv.append(str(launcher))
+        run_env = dict(os.environ, XDG_RUNTIME_DIR=str(steam_socket.parent))
+        if bus.is_socket():
+            run_env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+        try:
+            with log_path.open("ab") as log:
+                result = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                                        stdout=log, stderr=log, env=run_env,
+                                        timeout=20)
+            launched = result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            launched = False
+        if not launched:
+            info("systemd-run could not start the session outside Steam's "
+                 "service cgroup; starting it directly instead.")
+    if not launched:
+        try:
+            with log_path.open("ab") as log:
+                subprocess.Popen([str(launcher)], stdin=subprocess.DEVNULL,
+                                 stdout=log, stderr=log, env=env,
+                                 start_new_session=True)
+        except OSError as exc:
+            info(f"Could not start the built-in desktop session ({exc}); "
+                 "falling back to Steam's compositor.")
+            return None
     desktop_dir = steam_socket.parent / "nested_plasma"
     deadline = time.time() + 25
     while time.time() < deadline:
@@ -199,7 +229,16 @@ def start_desktop_session(steam_socket: Path) -> Path | None:
                 candidate = desktop_dir / name
                 if (re.fullmatch(r"wayland-\d+", name) and candidate.is_socket()
                         and candidate.stat().st_uid == os.getuid()):
-                    return candidate
+                    # Steam's teardown raced (and killed) the first attempt a
+                    # couple of seconds after its socket appeared; only trust
+                    # a session that is still up after settling.
+                    time.sleep(1.5)
+                    if candidate.is_socket():
+                        return candidate
+                    info("The auto-started desktop session died just after it "
+                         "came up (Steam's teardown likely raced this launch); "
+                         "falling back to Steam's compositor.")
+                    return None
         time.sleep(0.5)
     info(f"The built-in desktop session did not come up within 25 s (see {log_path}); "
          "falling back to Steam's compositor.")
@@ -1034,6 +1073,15 @@ def main() -> int:
                 info("WARNING: Bidirectional text clipboard can expose passwords to unencrypted KDE clipboard history.")
             prepare_flatpak_bootstrap(mount, share_clipboard=args.share_clipboard)
             info("Unlocked. Starting KDE; host SYSTEM Flatpaks are read-only, user Flatpaks are private, /host-home is available.")
+            # Compositor sessions can be torn down while the passphrase is
+            # typed (observed: Steam's teardown killed an auto-started
+            # desktop seconds after its socket appeared). Re-validate right
+            # before the socket is bound into bwrap instead of dying with
+            # 'Can't find source path' when that races this launch.
+            if not wayland_socket.is_socket():
+                info(f"The parent compositor socket vanished ({wayland_socket}); "
+                     "re-discovering the compositor to attach to ...")
+                runtime_base, wayland_socket = find_outer_wayland(args.attach)
             cmd = build_private_kde(home, mount, wayland_socket, runtime_base, args.width, args.height, clipboard_bin)
             return run_session(cmd)
         finally:
