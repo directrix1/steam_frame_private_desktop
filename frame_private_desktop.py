@@ -870,16 +870,18 @@ def install_menu_entry(share_clipboard: bool | None, width: int | None,
     collect = f"code=\"${{PIPESTATUS[0]}}\"; " if runner.endswith("bash") else "code=$?; "
     inner = (f"{q(python3)} {q(str(script))}{flags} 2>&1 | tee -a {log}; "
              f"{collect}printf '=== session ended rc=%s ===\\n' \"$code\" >> {log}; "
+             f"if [ \"$code\" != 0 ]; then printf '\\nPrivate Desktop exited with code %s.\\nFull log: {log}\\nPress Enter to close this window.\\n' \"$code\"; read -r _ || true; fi; "
              'exit "$code"')
     wrapper = ("#!/bin/sh\n"
                "# Opens the Frame private KDE desktop controller in a Konsole window.\n"
-               "# --hold keeps the window open after the command exits so prompts and\n"
-               "# errors stay readable; ALL output is also appended to launch.log:\n"
+               "# The window closes by itself when the desktop quits cleanly; on a\n"
+               "# nonzero exit it waits for Enter so the error stays readable. ALL\n"
+               "# output is also appended to launch.log:\n"
                "#   ~/.local/share/frame-private-desktop/launch.log\n"
                f"LOG={q(str(LAUNCH_LOG))}\n"
                'mkdir -p "${LOG%/*}" 2>/dev/null\n'
                "printf '\\n=== %s Private Desktop launch (pid %s) ===\\n' \"$(date -Is)\" \"$$\" >> \"$LOG\"\n"
-               f"exec {q(terminal)} --hold -e {q(runner)} -c {q(inner)}\n")
+               f"exec {q(terminal)} -e {q(runner)} -c {q(inner)}\n")
     MENU_WRAPPER.write_text(wrapper, encoding="utf-8")
     MENU_WRAPPER.chmod(0o755)
     MENU_ENTRY.parent.mkdir(parents=True, exist_ok=True)
