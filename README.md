@@ -34,6 +34,34 @@ session ends, the vault unmounts and nothing plaintext is left on disk.
   `fusermount3 -u` (with retries), and refuses to pretend success if anything
   still holds the mount. `SIGTERM` is treated the same way.
 
+## Controller input (why the desktop session matters)
+
+The Frame has no libinput devices in any desktop: the VR controllers are
+turned into pointer/keyboard events by Steam Input *inside* gamescope, which
+runs the headset's gaming-mode session and exposes its Wayland socket as
+`/run/user/1000/gamescope-0`. Valve's own gamescope source documents the weak
+spot: *"SteamVR sends VREvent_MouseButtonUp to whichever overlay the laser is
+over at release, so a press that started on us can end somewhere else"* —
+they mitigate with `--vr-overlay-enable-click-stabilization` (enabled for
+every overlay by the Frame's session) and synthetic-release guards, but a
+release landing on a *different valid* overlay (the `+` menu's Konsole, the
+QAM, Steam itself — all floating next to your desktop) can still leave a
+nested `kwin_wayland` holding the left button: the "stuck left click" symptom
+when nesting directly on `gamescope-0`.
+
+Steam's own nested KDE desktop (`/usr/bin/steamos-nested-desktop`, what the
+QAM's Desktop button launches) has the exact same architecture — plain
+`kwin_wayland` as a client of that same socket — but it is the *one* surface
+where Valve has tuned laser clicks to work, and its KWin relays a clean seat
+to whatever nests inside it. So the private desktop prefers to nest **inside**
+that session, and since 2026-10-28 it **starts the built-in session
+automatically** (same command, detached, logged to
+`~/.local/share/frame-private-desktop/desktop-session.log`) when a `+`-menu
+launch finds only Steam's compositor. That means: from the `+` menu the
+private desktop appears as a window inside the built-in Plasma desktop with
+working clicks. If you want to sit directly on the headset compositor anyway
+(keyboard-only use), force it with `--attach=steam`.
+
 ## Requirements
 
 - A **Steam Frame** running SteamOS (aarch64), launched from inside its nested
@@ -167,10 +195,11 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
 - **"WAYLAND_DISPLAY isn't set" from the `+` menu** — the `+` menu launches
   Konsole from gamescope's outer session, which has no Wayland display; the
   script auto-discovers a compositor socket under the user runtime, preferring
-  Steam's own gamescope socket (so the private desktop appears **on the
-  headset**, even after logging out of Plasma) and falling back to the nested
-  Plasma desktop's compositor. (Still fails from a plain SSH shell, as it
-  must.)
+  the nested Plasma desktop session and **starting Steam's built-in desktop by
+  itself** when only Steam's compositor is up (see *Controller input*). As a
+  last resort it nests on Steam's own gamescope socket — visible directly on
+  the headset, keyboard reliable, VR-controller clicks may stick. (Still
+  fails from a plain SSH shell, as it must.)
 - **Menu window flashes open and closes** — fixed: the script now prepends
   `~/.local/bin` to `PATH` itself (menu-launched Konsole inherits Plasma's
   minimal `PATH`, which hides `guix-env`), and the launcher runs

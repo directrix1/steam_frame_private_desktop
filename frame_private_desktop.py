@@ -154,6 +154,58 @@ def ensure_empty_vault_reset(cipher: Path) -> None:
     info(f"Previous EMPTY encrypted vault archived to: {backup}")
 
 
+def start_desktop_session(steam_socket: Path) -> Path | None:
+    """Start the Frame's built-in nested Plasma desktop; return its socket.
+
+    This is the command Steam's QAM 'Desktop' button runs (Steam spawns
+    /usr/bin/steamos-nested-desktop under steam.service). We reuse it
+    verbatim: gamescope's VR-laser button handling is only proven on that
+    single focused desktop overlay, and its KWin relays a clean seat to
+    anything nested inside (see README 'Controller input'). Returns None
+    (after logging why) when the session can't be started.
+    """
+    launcher = Path("/usr/bin/steamos-nested-desktop")
+    if not launcher.is_file():
+        info("No /usr/bin/steamos-nested-desktop on this system; cannot start "
+             "a Plasma desktop session automatically.")
+        return None
+    info("No Plasma desktop session is running; starting Steam's built-in one "
+         "(the QAM 'Desktop' button's own command) so controller input is "
+         "relayed reliably ...")
+    log_path = Path.home() / ".local/share/frame-private-desktop/desktop-session.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = {"HOME": str(Path.home()),
+           "USER": os.environ.get("USER") or "steamos",
+           "LOGNAME": os.environ.get("LOGNAME") or os.environ.get("USER") or "steamos",
+           "PATH": "/usr/local/bin:/usr/bin:/bin",
+           "TERM": "linux",
+           "XDG_RUNTIME_DIR": str(steam_socket.parent),
+           "XDG_SESSION_TYPE": "wayland",
+           "WAYLAND_DISPLAY": steam_socket.name}
+    try:
+        with log_path.open("ab") as log:
+            subprocess.Popen([str(launcher)], stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=log, env=env,
+                             start_new_session=True)
+    except OSError as exc:
+        info(f"Could not start the built-in desktop session ({exc}); "
+             "falling back to Steam's compositor.")
+        return None
+    desktop_dir = steam_socket.parent / "nested_plasma"
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        if desktop_dir.is_dir():
+            for name in sorted(entry.name for entry in desktop_dir.iterdir()):
+                candidate = desktop_dir / name
+                if (re.fullmatch(r"wayland-\d+", name) and candidate.is_socket()
+                        and candidate.stat().st_uid == os.getuid()):
+                    return candidate
+        time.sleep(0.5)
+    info(f"The built-in desktop session did not come up within 25 s (see {log_path}); "
+         "falling back to Steam's compositor.")
+    return None
+
+
 def find_outer_wayland(attach: str = "auto") -> tuple[Path, Path]:
     """Accept Steam Frame's nested_plasma runtime without trusting arbitrary paths.
 
@@ -186,32 +238,51 @@ def find_outer_wayland(attach: str = "auto") -> tuple[Path, Path]:
         return base, socket
     # A '+'-menu launch starts Konsole from gamescope's outer session, which
     # has no WAYLAND_DISPLAY at all. Discover a running compositor instead of
-    # failing. Prefer the Plasma desktop session: nesting inside it gives the
-    # private KWin a properly synthesized seat, while nesting directly on
-    # Steam's weston drops pointer button-release events (stuck clicks) for
-    # all but keyboard users. --attach=steam forces the direct route; with no
-    # desktop session running it is the only route. The existing checks
-    # (real socket, owned by us, under the user runtime) apply to all.
+    # failing. Prefer the Plasma desktop session, and start Steam's own
+    # built-in one when it isn't up: there is no input magic in it - Steam's
+    # desktop is just another kwin_wayland client on Steam's compositor socket
+    # - but it IS the one surface where Valve has made VR-laser clicks work,
+    # and its KWin relays a clean seat to everything nested inside. Nesting
+    # directly on Steam's gamescope compositor instead exposes a gamescope/
+    # SteamVR bug: a button press that starts on one VR overlay can get its
+    # release delivered to whichever overlay the laser reaches first (Valve's
+    # own code comments and their --vr-overlay-enable-click-stabilization
+    # flag document exactly this), which is the 'left click held down after
+    # first click' symptom. --attach=steam forces the direct route anyway.
+    # The existing checks (real socket, owned by us, under the user runtime)
+    # apply to all.
     desktop = (base / "nested_plasma", re.compile(r"wayland-\d+\Z"), "Plasma desktop compositor")
     steam = (base, re.compile(r"gamescope-\d+\Z"), "Steam session compositor (headset display)")
     other = (base, re.compile(r"wayland-\d+\Z"), "compositor")
+
+    def first_socket(candidate):
+        directory, pattern, label = candidate
+        if not directory.is_dir():
+            return None
+        for name in sorted(entry.name for entry in directory.iterdir()):
+            found = directory / name
+            if (pattern.fullmatch(name) and found.is_socket()
+                    and found.stat().st_uid == os.getuid()):
+                return found
+        return None
+
+    if attach in ("auto", "desktop") and first_socket(desktop) is None:
+        steam_socket = first_socket(steam)
+        if steam_socket is not None:
+            start_desktop_session(steam_socket)
     candidates = {"desktop": (desktop,),
                   "steam": (steam,),
                   "auto": (desktop, steam, other)}[attach]
-    for directory, pattern, label in candidates:
-        if not directory.is_dir():
-            continue
-        for name in sorted(entry.name for entry in directory.iterdir()):
-            candidate = directory / name
-            if (pattern.fullmatch(name) and candidate.is_socket()
-                    and candidate.stat().st_uid == os.getuid()):
-                info(f"WAYLAND_DISPLAY is unset; attaching to the {label} at {candidate}")
-                if label.startswith("Steam"):
-                    info("Tip: controller input is only fully reliable inside the "
-                         "Plasma desktop session; start it first (Desktop panel) "
-                         "and relaunch for mouse-perfect nesting.")
-                os.environ["XDG_RUNTIME_DIR"] = str(candidate.parent)
-                return base, candidate
+    for candidate in candidates:
+        found = first_socket(candidate)
+        if found is not None:
+            info(f"WAYLAND_DISPLAY is unset; attaching to the {candidate[2]} at {found}")
+            if candidate[2].startswith("Steam"):
+                info("Tip: controller input is only fully reliable inside the "
+                     "Plasma desktop session; the private desktop nests there "
+                     "whenever one is running.")
+            os.environ["XDG_RUNTIME_DIR"] = str(found.parent)
+            return base, found
     raise LaunchError(
         f"WAYLAND_DISPLAY isn't set and no compositor for --attach={attach} "
         f"exists under {base}. From the '+' menu: start the Desktop panel for "
