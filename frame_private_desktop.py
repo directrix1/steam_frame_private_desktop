@@ -181,7 +181,12 @@ def start_desktop_session(steam_socket: Path) -> Path | None:
            "TERM": "linux",
            "XDG_RUNTIME_DIR": str(steam_socket.parent),
            "XDG_SESSION_TYPE": "wayland",
-           "WAYLAND_DISPLAY": steam_socket.name}
+           # Absolute path, not the bare "gamescope-0": steamos-nested-desktop
+           # swaps XDG_RUNTIME_DIR to .../nested_plasma, and KWin then resolves
+           # a bare name against the NEW runtime dir, fails to find the parent
+           # socket, and silent-crash-loops (observed: wrapper exits rc=0 in
+           # ~740 ms, no socket ever appears).
+           "WAYLAND_DISPLAY": str(steam_socket)}
     # A '+'-menu Konsole lives inside steam.service's cgroup, and children
     # inherit it: the first auto-started desktop was SIGTERMed by Steam's
     # teardown of the desktop the user had just closed, seconds after it
@@ -236,13 +241,119 @@ def start_desktop_session(steam_socket: Path) -> Path | None:
                     if candidate.is_socket():
                         return candidate
                     info("The auto-started desktop session died just after it "
-                         "came up (Steam's teardown likely raced this launch); "
-                         "falling back to Steam's compositor.")
+                         "came up (see desktop-session.log); falling back to "
+                         "Steam's compositor.")
                     return None
         time.sleep(0.5)
     info(f"The built-in desktop session did not come up within 25 s (see {log_path}); "
          "falling back to Steam's compositor.")
     return None
+
+
+KWIN_RULES = Path.home() / ".config/kwinrulesrc"
+KWIN_RULE_ID = "frame-private-desktop-fullscreen"
+
+
+def _kwin_rules_groups(text: str) -> list[tuple[str | None, list[str]]]:
+    groups: list[tuple[str | None, list[str]]] = [(None, [])]
+    for line in text.splitlines():
+        match = re.fullmatch(r"\[(.*)\]\s*", line)
+        if match:
+            groups.append((match.group(1), []))
+        else:
+            groups[-1][1].append(line)
+    return groups
+
+
+def set_fullscreen_rule(enabled: bool) -> bool:
+    """Add/remove a KWin rule that force-fullscreens nested desktops.
+
+    A nested kwin_wayland window has an EMPTY window class on the Frame's
+    desktop; its only stable identifier is its title, "KDE Wayland
+    Compositor ...". Values: windownamematch=2 (substring), fullscreenrule=2
+    (Force). Returns True when the file changed.
+    """
+    try:
+        text = KWIN_RULES.read_text(encoding="utf-8") if KWIN_RULES.exists() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        info(f"Cannot read {KWIN_RULES} ({exc}); skipping fullscreen rule.")
+        return False
+    groups = [g for g in _kwin_rules_groups(text) if g[0] != KWIN_RULE_ID]
+    general = next((g for g in groups if g[0] == "General"), None)
+    if general is None:
+        general = ("General", [])
+        groups.insert(1, general)
+    ids: list[str] = []
+    other: list[str] = []
+    for line in general[1]:
+        key, _, value = line.partition("=")
+        if key.strip() == "rules":
+            ids = [r for r in value.strip().split(",") if r]
+        elif key.strip() != "count":
+            other.append(line)
+    ids = [r for r in ids if r != KWIN_RULE_ID]
+    if enabled:
+        ids.append(KWIN_RULE_ID)
+        groups.append((KWIN_RULE_ID, [
+            "Description=Frame private desktop: fullscreen nested KDE",
+            "fullscreen=true",
+            "fullscreenrule=2",
+            "types=1",
+            "windowname=KDE Wayland Compositor",
+            "windownamematch=2",
+            "",
+        ]))
+    general[1][:] = [f"count={len(ids)}", f"rules={','.join(ids)}"] + [
+        line for line in other if line.strip()] + [""]
+    out = []
+    for name, lines in groups:
+        if name is not None:
+            out.append(f"[{name}]")
+        out.extend(lines)
+    new_text = "\n".join(out).strip("\n") + "\n"
+    only_ours_left = (not ids and not [l for l in other if l.strip()]
+                      and all(name in (None, "General") for name, _ in groups)
+                      and not any(l.strip() for name, lines in groups
+                                  if name is None for l in lines))
+    if only_ours_left:
+        # Nothing but our (now removed) rule was ever in it: delete the file
+        # rather than leave an empty rules config behind.
+        if KWIN_RULES.exists():
+            KWIN_RULES.unlink()
+            return True
+        return False
+    if new_text == text:
+        return False
+    KWIN_RULES.parent.mkdir(parents=True, exist_ok=True)
+    tmp = KWIN_RULES.with_name(KWIN_RULES.name + ".frame-tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    os.replace(tmp, KWIN_RULES)
+    return True
+
+
+def reload_desktop_kwin() -> bool:
+    """Ask the running Plasma desktop's KWin to re-read its rules.
+
+    The desktop session has a private dbus-run-session bus under /tmp; probe
+    the sockets for the one that hosts org.kde.KWin.
+    """
+    if not shutil.which("dbus-send"):
+        return False
+    sockets = sorted(Path("/tmp").glob("dbus-*"), key=lambda p: p.stat().st_mtime,
+                     reverse=True)
+    for sock in sockets:
+        try:
+            if not sock.is_socket() or sock.stat().st_uid != os.getuid():
+                continue
+            result = subprocess.run(
+                ["dbus-send", f"--bus=unix:path={sock}", "--print-reply",
+                 "--dest=org.kde.KWin", "/KWin", "org.kde.KWin.reconfigure"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            return True
+    return False
 
 
 def find_outer_wayland(attach: str = "auto") -> tuple[Path, Path]:
@@ -958,6 +1069,9 @@ def main() -> int:
                         help="Which compositor to nest on when none is given: 'auto' prefers the "
                              "Plasma desktop session (reliable controller input), falling back to "
                              "Steam's own compositor; 'desktop'/'steam' force one (default: auto)")
+    parser.add_argument("--windowed", action="store_true",
+                        help="Inside the Plasma desktop, open as a normal window instead of "
+                             "fullscreen (default: fullscreen, replacing the desktop until you quit)")
     parser.add_argument("--reset-empty-vault", action="store_true",
                         help="Archive and reinitialize an EMPTY vault; don't use routinely")
     args = parser.parse_args()
@@ -1054,6 +1168,7 @@ def main() -> int:
 
         fuse_child = None
         mounted = False
+        fullscreen_rule = False
         try:
             fuse_child = mount_foreground(binary, cipher, mount)
             mounted = True
@@ -1083,8 +1198,25 @@ def main() -> int:
                      "re-discovering the compositor to attach to ...")
                 runtime_base, wayland_socket = find_outer_wayland(args.attach)
             cmd = build_private_kde(home, mount, wayland_socket, runtime_base, args.width, args.height, clipboard_bin)
+            if wayland_socket.parent.name == "nested_plasma" and not args.windowed:
+                # Inside the Plasma desktop: force our window fullscreen so it
+                # replaces the desktop (and gets all keyboard/mouse input)
+                # until the private session ends. Rule is removed on exit.
+                try:
+                    fullscreen_rule = set_fullscreen_rule(True)
+                except OSError as exc:
+                    info(f"Could not write the fullscreen window rule ({exc}); opening windowed.")
+                if fullscreen_rule and not reload_desktop_kwin():
+                    info("Could not reach the desktop's KWin to apply the fullscreen "
+                         "rule; the private desktop may open windowed.")
             return run_session(cmd)
         finally:
+            if fullscreen_rule:
+                try:
+                    set_fullscreen_rule(False)
+                    reload_desktop_kwin()
+                except OSError:
+                    pass
             if mounted or os.path.ismount(mount):
                 unmount(mount)
             if fuse_child is not None:
