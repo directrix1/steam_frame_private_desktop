@@ -56,8 +56,19 @@ where Valve has tuned laser clicks to work, and its KWin relays a clean seat
 to whatever nests inside it.
 
 **Where it opens:** a `+`-menu launch always gets **its own window in the VR
-environment** (nested directly on Steam's compositor; clicks may stick as
-described above, the keyboard is fine). Pass `--attach=desktop` to nest inside
+environment** (nested directly on Steam's compositor).
+
+**Why clicks used to misbehave there:** gamescope turns a VR-controller
+trigger pull into a mouse click only for windows that belong to a Steam app.
+It decides by the window's process: a cgroup scope named
+`app-steam-app<ID>-<pid>.scope`, or a Steam `reaper` ancestor. `+`-menu
+launches have neither, so gamescope treated the private desktop as a
+"non-Steam window" and delivered trigger pulls as raw *touchscreen* taps. The
+session now runs inside such a scope (via `systemd-run --user --scope`, with an
+ID in Steam's non-Steam-shortcut range), so it gets real left-button
+press/release events like a regular desktop.
+
+Pass `--attach=desktop` to nest inside
 the Plasma desktop instead — it is started automatically if it isn't running
 (same command as the QAM button, logged to
 `~/.local/share/frame-private-desktop/desktop-session.log`).

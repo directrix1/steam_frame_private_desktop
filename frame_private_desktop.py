@@ -45,6 +45,7 @@ import stat
 import subprocess
 import sys
 import time
+import zlib
 
 APP = "frame-private-desktop"
 REL_STATE = Path(".local/share/frame-private-desktop")
@@ -430,9 +431,7 @@ def find_outer_wayland(attach: str = "auto") -> tuple[Path, Path]:
         if found is not None:
             info(f"WAYLAND_DISPLAY is unset; attaching to the {candidate[2]} at {found}")
             if candidate[2].startswith("Steam"):
-                info("Opening as its own window in the VR environment. Note: "
-                     "VR-controller clicks can stick here (a SteamVR/gamescope "
-                     "bug); the keyboard is unaffected.")
+                info("Opening as its own window in the VR environment.")
             os.environ["XDG_RUNTIME_DIR"] = str(found.parent)
             return base, found
     raise LaunchError(
@@ -881,8 +880,43 @@ def build_private_kde(home: Path, mount: Path, wayland_socket: Path, runtime_bas
     return args
 
 
-def run_session(args: list[str]) -> int:
-    child = subprocess.Popen(args, start_new_session=True)
+STEAM_APP_ID = 0x80000000 | (zlib.crc32(b"frame-private-desktop") & 0x7FFFFFFF)
+
+
+def steam_app_scope(cmd: list[str]) -> tuple[list[str], dict[str, str] | None]:
+    """Run the session in a scope gamescope recognizes as a Steam app.
+
+    gamescope gives a Wayland window an app ID only if its process sits in a
+    cgroup scope named app-steam-app<ID>-<pid>.scope (or under Steam's
+    'reaper'). '+'-menu launches have neither, so our window is treated as a
+    "non-Steam window" and VR-controller trigger pulls are delivered as raw
+    TOUCH events (TouchClickModes::Passthrough), which a nested KWin does
+    not turn into reliable clicks. With an app ID, gamescope uses
+    TouchClickModes::Left instead: a genuine left-button press/release.
+    The ID uses Steam's non-Steam-shortcut range (high bit set).
+    """
+    if not shutil.which("systemd-run"):
+        return cmd, None
+    runtime = f"/run/user/{os.getuid()}"
+    env = dict(os.environ, XDG_RUNTIME_DIR=runtime,
+               DBUS_SESSION_BUS_ADDRESS=f"unix:path={runtime}/bus")
+    unit = f"app-steam-app{STEAM_APP_ID}-{os.getpid()}"
+    base = ["systemd-run", "--user", "--scope", "--quiet", "--collect"]
+    try:
+        probe = subprocess.run(base + [f"--unit={unit}-probe", "true"], env=env,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        probe = None
+    if probe is None or probe.returncode != 0:
+        info("Could not create a Steam app scope (systemd-run failed); VR-controller "
+             "clicks will arrive as touch input.")
+        return cmd, None
+    return base + [f"--unit={unit}", "--"] + cmd, env
+
+
+def run_session(args: list[str], env: dict[str, str] | None = None) -> int:
+    child = subprocess.Popen(args, start_new_session=True, env=env)
     try:
         status = child.wait()
     except KeyboardInterrupt:
@@ -1218,7 +1252,10 @@ def main() -> int:
                 if fullscreen_rule and not reload_desktop_kwin():
                     info("Could not reach the desktop's KWin to apply the fullscreen "
                          "rule; the private desktop may open windowed.")
-            return run_session(cmd)
+            session_env = None
+            if wayland_socket.parent.name != "nested_plasma":
+                cmd, session_env = steam_app_scope(cmd)
+            return run_session(cmd, session_env)
         finally:
             if fullscreen_rule:
                 try:
