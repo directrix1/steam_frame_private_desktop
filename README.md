@@ -53,14 +53,14 @@ Steam's own nested KDE desktop (`/usr/bin/steamos-nested-desktop`, what the
 QAM's Desktop button launches) has the exact same architecture — plain
 `kwin_wayland` as a client of that same socket — but it is the *one* surface
 where Valve has tuned laser clicks to work, and its KWin relays a clean seat
-to whatever nests inside it. So the private desktop prefers to nest **inside**
-that session, and since 2026-10-28 it **starts the built-in session
-automatically** (same command, detached, logged to
-`~/.local/share/frame-private-desktop/desktop-session.log`) when a `+`-menu
-launch finds only Steam's compositor. That means: from the `+` menu the
-private desktop appears as a window inside the built-in Plasma desktop with
-working clicks. If you want to sit directly on the headset compositor anyway
-(keyboard-only use), force it with `--attach=steam`.
+to whatever nests inside it.
+
+**Where it opens:** a `+`-menu launch always gets **its own window in the VR
+environment** (nested directly on Steam's compositor; clicks may stick as
+described above, the keyboard is fine). Pass `--attach=desktop` to nest inside
+the Plasma desktop instead — it is started automatically if it isn't running
+(same command as the QAM button, logged to
+`~/.local/share/frame-private-desktop/desktop-session.log`).
 
 When launched from the KDE application menu inside the Plasma desktop, the
 private desktop opens **fullscreen**, covering the regular desktop and taking
@@ -201,11 +201,10 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
   plus the exit code.
 - **"WAYLAND_DISPLAY isn't set" from the `+` menu** — the `+` menu launches
   Konsole from gamescope's outer session, which has no Wayland display; the
-  script auto-discovers a compositor socket under the user runtime, preferring
-  the nested Plasma desktop session and **starting Steam's built-in desktop by
-  itself** when only Steam's compositor is up (see *Controller input*). As a
-  last resort it nests on Steam's own gamescope socket — visible directly on
-  the headset, keyboard reliable, VR-controller clicks may stick. (Still
+  script auto-discovers a compositor socket under the user runtime and nests
+  on Steam's own gamescope socket, so it appears as its own window in the VR
+  environment (keyboard reliable, VR-controller clicks may stick;
+  `--attach=desktop` nests in the Plasma desktop instead). (Still
   fails from a plain SSH shell, as it must.)
 - **Menu window flashes open and closes** — fixed: the script now prepends
   `~/.local/bin` to `PATH` itself (menu-launched Konsole inherits Plasma's

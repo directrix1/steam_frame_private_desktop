@@ -430,9 +430,9 @@ def find_outer_wayland(attach: str = "auto") -> tuple[Path, Path]:
         if found is not None:
             info(f"WAYLAND_DISPLAY is unset; attaching to the {candidate[2]} at {found}")
             if candidate[2].startswith("Steam"):
-                info("Tip: controller input is only fully reliable inside the "
-                     "Plasma desktop session; the private desktop nests there "
-                     "whenever one is running.")
+                info("Opening as its own window in the VR environment. Note: "
+                     "VR-controller clicks can stick here (a SteamVR/gamescope "
+                     "bug); the keyboard is unaffected.")
             os.environ["XDG_RUNTIME_DIR"] = str(found.parent)
             return base, found
     raise LaunchError(
@@ -1111,6 +1111,11 @@ def main() -> int:
             info("Launched from the '+' menu: clipboard sharing is off by default. "
                  "Pass --share-clipboard to bridge with the desktop session anyway.")
 
+    # A '+'-menu launch gets its own window in the VR environment: nest on
+    # Steam's compositor directly, never inside (or by starting) a Plasma
+    # desktop session. --attach=desktop still overrides.
+    if menu_launch and args.attach == "auto":
+        args.attach = "steam"
     runtime_base, wayland_socket = find_outer_wayland(args.attach)
     state = home / REL_STATE
     state.mkdir(parents=True, exist_ok=True)
