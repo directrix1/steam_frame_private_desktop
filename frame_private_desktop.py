@@ -270,8 +270,10 @@ def set_fullscreen_rule(enabled: bool) -> bool:
 
     A nested kwin_wayland window has an EMPTY window class on the Frame's
     desktop; its only stable identifier is its title, "KDE Wayland
-    Compositor ...". Values: windownamematch=2 (substring), fullscreenrule=2
-    (Force). Returns True when the file changed.
+    Compositor ...". Keys are KWin's own: title/titlematch=2 (substring),
+    fullscreenrule=2 (Force). An unknown match key leaves the rule with no
+    criteria at all, so it would force EVERY window fullscreen. Returns True
+    when the file changed.
     """
     try:
         text = KWIN_RULES.read_text(encoding="utf-8") if KWIN_RULES.exists() else ""
@@ -299,8 +301,8 @@ def set_fullscreen_rule(enabled: bool) -> bool:
             "fullscreen=true",
             "fullscreenrule=2",
             "types=1",
-            "windowname=KDE Wayland Compositor",
-            "windownamematch=2",
+            "title=KDE Wayland Compositor",
+            "titlematch=2",
             "",
         ]))
     general[1][:] = [f"count={len(ids)}", f"rules={','.join(ids)}"] + [
