@@ -58,15 +58,15 @@ to whatever nests inside it.
 **Where it opens:** a `+`-menu launch always gets **its own window in the VR
 environment** (nested directly on Steam's compositor).
 
-**Why clicks used to misbehave there:** gamescope turns a VR-controller
-trigger pull into a mouse click only for windows that belong to a Steam app.
-It decides by the window's process: a cgroup scope named
-`app-steam-app<ID>-<pid>.scope`, or a Steam `reaper` ancestor. `+`-menu
-launches have neither, so gamescope treated the private desktop as a
-"non-Steam window" and delivered trigger pulls as raw *touchscreen* taps. The
-session now runs inside such a scope (via `systemd-run --user --scope`, with an
-ID in Steam's non-Steam-shortcut range), so it gets real left-button
-press/release events like a regular desktop.
+**How clicks work there:** gamescope turns a VR-controller trigger pull into a
+touchscreen tap, then decides per window what to deliver. Native Wayland
+windows without a Steam app ID get raw touch (clicks that don't register or
+release properly); windows *with* an app ID get mouse clicks but Steam treats
+them as games (theater mode). Steam's own desktop avoids both: its KWin runs
+with the **X11 windowed backend** on gamescope's Xwayland (`DISPLAY=:0`), where
+gamescope enables touch-pointer emulation, so taps become ordinary mouse
+clicks with a cursor, in a normal window. The private desktop now does the
+same for `+`-menu launches.
 
 Pass `--attach=desktop` to nest inside
 the Plasma desktop instead — it is started automatically if it isn't running

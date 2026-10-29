@@ -45,7 +45,6 @@ import stat
 import subprocess
 import sys
 import time
-import zlib
 
 APP = "frame-private-desktop"
 REL_STATE = Path(".local/share/frame-private-desktop")
@@ -789,7 +788,7 @@ def find_host_audio_sockets(runtime_base: Path, wayland_socket: Path) -> dict[st
     return found
 
 
-def build_private_kde(home: Path, mount: Path, wayland_socket: Path, runtime_base: Path, width: int, height: int, clipboard_bin: str | None) -> list[str]:
+def build_private_kde(home: Path, mount: Path, wayland_socket: Path, runtime_base: Path, width: int, height: int, clipboard_bin: str | None, x11_display: str | None = None) -> list[str]:
     prefix = home / ".local/share/guix"
     store = prefix / "gnu/store"
     profiles = prefix / "var/guix"
@@ -821,6 +820,16 @@ def build_private_kde(home: Path, mount: Path, wayland_socket: Path, runtime_bas
     }
     if clipboard_bin:
         env['FRAME_CLIP_BIN'] = clipboard_bin
+    if x11_display:
+        # Run the private KWin with its X11 windowed backend on gamescope's
+        # Xwayland, exactly like Steam's own desktop (KWin picks the X11
+        # backend when DISPLAY is set and WAYLAND_DISPLAY is not). gamescope
+        # gives non-Steam X11 windows touch-pointer emulation, so VR
+        # controller trigger pulls become real mouse clicks, with a cursor
+        # and without Steam treating the window as a game (theater mode).
+        # The parent Wayland socket stays bound for the clipboard bridge.
+        del env["WAYLAND_DISPLAY"]
+        env["DISPLAY"] = x11_display
     for key in ("LC_ALL", "LC_MESSAGES", "TZ"):
         if key in os.environ:
             env[key] = os.environ[key]
@@ -870,6 +879,9 @@ def build_private_kde(home: Path, mount: Path, wayland_socket: Path, runtime_bas
     # /etc/resolv.conf is frequently a symlink into /run on SteamOS.
     # Our private tmpfs /run would otherwise leave it dangling (offline browsers).
     args += host_resolver_bind()
+    if x11_display:
+        number = x11_display.lstrip(":").split(".")[0]
+        args += ["--ro-bind", f"/tmp/.X11-unix/X{number}", f"/tmp/.X11-unix/X{number}"]
     if "pulse/native" in audio:
         args += ["--dir", f"{inner_runtime}/pulse"]
     for name, src in audio.items():
@@ -880,43 +892,28 @@ def build_private_kde(home: Path, mount: Path, wayland_socket: Path, runtime_bas
     return args
 
 
-STEAM_APP_ID = 0x80000000 | (zlib.crc32(b"frame-private-desktop") & 0x7FFFFFFF)
+def gamescope_x11_display() -> str | None:
+    """Return gamescope's Xwayland display (the one Steam's desktop uses).
 
-
-def steam_app_scope(cmd: list[str]) -> tuple[list[str], dict[str, str] | None]:
-    """Run the session in a scope gamescope recognizes as a Steam app.
-
-    gamescope gives a Wayland window an app ID only if its process sits in a
-    cgroup scope named app-steam-app<ID>-<pid>.scope (or under Steam's
-    'reaper'). '+'-menu launches have neither, so our window is treated as a
-    "non-Steam window" and VR-controller trigger pulls are delivered as raw
-    TOUCH events (TouchClickModes::Passthrough), which a nested KWin does
-    not turn into reliable clicks. With an app ID, gamescope uses
-    TouchClickModes::Left instead: a genuine left-button press/release.
-    The ID uses Steam's non-Steam-shortcut range (high bit set).
+    A '+'-menu launch inherits DISPLAY=:0 from gamescope. gamescope's
+    Xwayland runs without auth, so only the socket needs binding.
     """
-    if not shutil.which("systemd-run"):
-        return cmd, None
-    runtime = f"/run/user/{os.getuid()}"
-    env = dict(os.environ, XDG_RUNTIME_DIR=runtime,
-               DBUS_SESSION_BUS_ADDRESS=f"unix:path={runtime}/bus")
-    unit = f"app-steam-app{STEAM_APP_ID}-{os.getpid()}"
-    base = ["systemd-run", "--user", "--scope", "--quiet", "--collect"]
-    try:
-        probe = subprocess.run(base + [f"--unit={unit}-probe", "true"], env=env,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        probe = None
-    if probe is None or probe.returncode != 0:
-        info("Could not create a Steam app scope (systemd-run failed); VR-controller "
-             "clicks will arrive as touch input.")
-        return cmd, None
-    return base + [f"--unit={unit}", "--"] + cmd, env
+    candidates = [os.environ.get("DISPLAY", ""), ":0"]
+    for display in candidates:
+        match = re.fullmatch(r":(\d+)(?:\.\d+)?", display)
+        if not match:
+            continue
+        sock = Path(f"/tmp/.X11-unix/X{match.group(1)}")
+        try:
+            if sock.is_socket() and sock.stat().st_uid == os.getuid():
+                return f":{match.group(1)}"
+        except OSError:
+            continue
+    return None
 
 
-def run_session(args: list[str], env: dict[str, str] | None = None) -> int:
-    child = subprocess.Popen(args, start_new_session=True, env=env)
+def run_session(args: list[str]) -> int:
+    child = subprocess.Popen(args, start_new_session=True)
     try:
         status = child.wait()
     except KeyboardInterrupt:
@@ -1238,7 +1235,13 @@ def main() -> int:
                 info(f"The parent compositor socket vanished ({wayland_socket}); "
                      "re-discovering the compositor to attach to ...")
                 runtime_base, wayland_socket = find_outer_wayland(args.attach)
-            cmd = build_private_kde(home, mount, wayland_socket, runtime_base, args.width, args.height, clipboard_bin)
+            x11_display = None
+            if wayland_socket.parent.name != "nested_plasma":
+                x11_display = gamescope_x11_display()
+                if x11_display is None:
+                    info("No gamescope X11 display found; nesting on its Wayland "
+                         "socket instead (VR-controller clicks may arrive as touch).")
+            cmd = build_private_kde(home, mount, wayland_socket, runtime_base, args.width, args.height, clipboard_bin, x11_display)
             if (wayland_socket.parent.name == "nested_plasma" and not menu_launch
                     and not args.windowed):
                 # Launched from KDE's own menu inside the Plasma desktop: force
@@ -1252,10 +1255,7 @@ def main() -> int:
                 if fullscreen_rule and not reload_desktop_kwin():
                     info("Could not reach the desktop's KWin to apply the fullscreen "
                          "rule; the private desktop may open windowed.")
-            session_env = None
-            if wayland_socket.parent.name != "nested_plasma":
-                cmd, session_env = steam_app_scope(cmd)
-            return run_session(cmd, session_env)
+            return run_session(cmd)
         finally:
             if fullscreen_rule:
                 try:
