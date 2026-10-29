@@ -1200,10 +1200,12 @@ def main() -> int:
                      "re-discovering the compositor to attach to ...")
                 runtime_base, wayland_socket = find_outer_wayland(args.attach)
             cmd = build_private_kde(home, mount, wayland_socket, runtime_base, args.width, args.height, clipboard_bin)
-            if wayland_socket.parent.name == "nested_plasma" and not args.windowed:
-                # Inside the Plasma desktop: force our window fullscreen so it
-                # replaces the desktop (and gets all keyboard/mouse input)
-                # until the private session ends. Rule is removed on exit.
+            if (wayland_socket.parent.name == "nested_plasma" and not menu_launch
+                    and not args.windowed):
+                # Launched from KDE's own menu inside the Plasma desktop: force
+                # our window fullscreen so it replaces the desktop until the
+                # private session ends. '+'-menu launches stay windowed.
+                # The rule is removed on exit.
                 try:
                     fullscreen_rule = set_fullscreen_rule(True)
                 except OSError as exc:

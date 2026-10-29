@@ -62,11 +62,12 @@ private desktop appears as a window inside the built-in Plasma desktop with
 working clicks. If you want to sit directly on the headset compositor anyway
 (keyboard-only use), force it with `--attach=steam`.
 
-Inside the Plasma desktop the private desktop opens **fullscreen**, covering
-the regular desktop and taking all keyboard and mouse input until you quit it.
-This is done with a temporary KWin window rule in `~/.config/kwinrulesrc`,
-which is removed again when the session ends. Pass `--windowed` to get a
-normal window instead.
+When launched from the KDE application menu inside the Plasma desktop, the
+private desktop opens **fullscreen**, covering the regular desktop and taking
+all keyboard and mouse input until you quit it. Launched from the Frame's `+`
+menu it opens as a normal window. Fullscreen uses a temporary KWin window rule
+in `~/.config/kwinrulesrc`, which is removed again when the session ends.
+Pass `--windowed` to get a normal window from the KDE menu too.
 
 ## Requirements
 
