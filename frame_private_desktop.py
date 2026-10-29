@@ -1010,7 +1010,41 @@ def refresh_kde_menus() -> None:
                          start_new_session=True)
 
 
-def menu_entry_text() -> str:
+ICON_NAME = "frame-private-desktop"
+ICON_SOURCES = Path(__file__).resolve().parent / "icons"
+ICON_TARGETS = {
+    "frame-private-desktop.png": Path.home() / ".local/share/icons/hicolor/256x256/apps",
+    "frame-private-desktop.svg": Path.home() / ".local/share/icons/hicolor/scalable/apps",
+}
+
+
+def install_icon() -> str:
+    """Install the padlocked desktop icon into the user's icon theme.
+
+    Returns the Icon= value: our themed name, or a stock fallback when the
+    icon files are missing (e.g. only the script was copied).
+    """
+    installed = False
+    for name, target in ICON_TARGETS.items():
+        source = ICON_SOURCES / name
+        if source.is_file():
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target / name)
+            (target / name).chmod(0o644)
+            installed = True
+    if not installed:
+        return "system-lock-screen"
+    hicolor = Path.home() / ".local/share/icons/hicolor"
+    os.utime(hicolor)  # nudge icon caches to rescan
+    return ICON_NAME
+
+
+def remove_icon() -> None:
+    for name, target in ICON_TARGETS.items():
+        (target / name).unlink(missing_ok=True)
+
+
+def menu_entry_text(icon: str = "system-lock-screen") -> str:
     # The Frame '+' menu / "Add Library Shortcut" scanner wants: a single-token
     # absolute Exec with no spaces or quotes, Type=Application, no NoDisplay,
     # no Categories=Settings. The generated wrapper supplies the Konsole window
@@ -1023,7 +1057,7 @@ def menu_entry_text() -> str:
             "GenericName=Encrypted desktop\n"
             "Comment=Unlock and launch a nested encrypted KDE desktop\n"
             f"Exec={MENU_WRAPPER}\n"
-            "Icon=system-lock-screen\n"
+            f"Icon={icon}\n"
             "Terminal=false\n"
             "Categories=Utility;Security;\n"
             "StartupNotify=false\n")
@@ -1068,7 +1102,7 @@ def install_menu_entry(share_clipboard: bool | None, width: int | None,
     MENU_WRAPPER.write_text(wrapper, encoding="utf-8")
     MENU_WRAPPER.chmod(0o755)
     MENU_ENTRY.parent.mkdir(parents=True, exist_ok=True)
-    MENU_ENTRY.write_text(menu_entry_text(), encoding="utf-8")
+    MENU_ENTRY.write_text(menu_entry_text(install_icon()), encoding="utf-8")
     MENU_ENTRY.chmod(0o755)
     refresh_kde_menus()
     info(f"Installed menu launcher: {MENU_ENTRY} (Exec wrapper: {MENU_WRAPPER})")
@@ -1079,6 +1113,7 @@ def install_menu_entry(share_clipboard: bool | None, width: int | None,
 def remove_menu_entry() -> None:
     MENU_ENTRY.unlink(missing_ok=True)
     MENU_WRAPPER.unlink(missing_ok=True)
+    remove_icon()
     refresh_kde_menus()
     info('Removed the "Private Desktop" menu entry and its wrapper.')
 

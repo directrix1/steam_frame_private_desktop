@@ -194,6 +194,8 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
 | `~/.local/share/frame-private-desktop/launch.log` | every `+`-menu launch: full output of the controller *and* the nested Plasma session, with exit codes |
 | `~/.local/share/frame-private-desktop/bin/` | in-vault startup shim (`private-plasma-start`, kwin wrappers, clipboard bridge) |
 | `~/.local/bin/gocryptfs-native` | Guix `gocryptfs` ELF run via `/lib/ld-linux-aarch64.so.1` |
+| `~/.local/share/applications/frame-private-desktop.desktop` | the `+` menu entry (`--install-launcher`) |
+| `~/.local/share/icons/hicolor/{256x256,scalable}/apps/frame-private-desktop.*` | its icon: the Desktop icon with a padlock |
 
 ## Troubleshooting
 
@@ -236,3 +238,8 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
 
 Same terms as the original script in this repository; add a license file if you
 intend to redistribute.
+
+The menu icon (`icons/frame-private-desktop.{svg,png}`) is KDE's Breeze
+`desktop` icon — the one the Frame's built-in Desktop entry shows — with a
+padlock badge added. Breeze icons are LGPL-3.0-or-later (© KDE). Regenerate
+it on the Frame with `icons/make_icon.py`.
