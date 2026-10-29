@@ -1099,9 +1099,10 @@ def main() -> int:
     clipboard.add_argument("--no-share-clipboard", dest="share_clipboard", action="store_false",
                            help="Disable clipboard sharing to keep private clipboard data off the host")
     parser.add_argument("--attach", choices=("auto", "desktop", "steam"), default="auto",
-                        help="Which compositor to nest on when none is given: 'auto' prefers the "
-                             "Plasma desktop session (reliable controller input), falling back to "
-                             "Steam's own compositor; 'desktop'/'steam' force one (default: auto)")
+                        help="Which compositor to nest on when WAYLAND_DISPLAY is unset (the '+' "
+                             "menu): 'auto'/'steam' open as their own VR window on Steam's "
+                             "compositor; 'desktop' nests inside the Plasma desktop, starting it "
+                             "if needed (default: auto)")
     parser.add_argument("--windowed", action="store_true",
                         help="Inside the Plasma desktop, open as a normal window instead of "
                              "fullscreen (default: fullscreen, replacing the desktop until you quit)")

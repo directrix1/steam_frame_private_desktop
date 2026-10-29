@@ -34,51 +34,46 @@ session ends, the vault unmounts and nothing plaintext is left on disk.
   `fusermount3 -u` (with retries), and refuses to pretend success if anything
   still holds the mount. `SIGTERM` is treated the same way.
 
-## Controller input (why the desktop session matters)
+## Where it opens and how the controllers work
 
-The Frame has no libinput devices in any desktop: the VR controllers are
-turned into pointer/keyboard events by Steam Input *inside* gamescope, which
-runs the headset's gaming-mode session and exposes its Wayland socket as
-`/run/user/1000/gamescope-0`. Valve's own gamescope source documents the weak
-spot: *"SteamVR sends VREvent_MouseButtonUp to whichever overlay the laser is
-over at release, so a press that started on us can end somewhere else"* —
-they mitigate with `--vr-overlay-enable-click-stabilization` (enabled for
-every overlay by the Frame's session) and synthetic-release guards, but a
-release landing on a *different valid* overlay (the `+` menu's Konsole, the
-QAM, Steam itself — all floating next to your desktop) can still leave a
-nested `kwin_wayland` holding the left button: the "stuck left click" symptom
-when nesting directly on `gamescope-0`.
+| Launched from | Result |
+|---|---|
+| Frame `+` menu | Its **own window in the VR environment** |
+| KDE application menu, inside the Plasma desktop | **Fullscreen** over the desktop until you quit |
 
-Steam's own nested KDE desktop (`/usr/bin/steamos-nested-desktop`, what the
-QAM's Desktop button launches) has the exact same architecture — plain
-`kwin_wayland` as a client of that same socket — but it is the *one* surface
-where Valve has tuned laser clicks to work, and its KWin relays a clean seat
-to whatever nests inside it.
+**VR-controller clicks.** The Frame has no real mouse: gamescope (Steam's
+compositor, which runs the headset session) turns each controller trigger
+pull into a *touchscreen tap*, then decides per window what to deliver
+(see `OpenVRBackend.cpp`, `wlserver.cpp` and `Utils/Process.cpp` in
+[gamescope](https://github.com/ValveSoftware/gamescope)):
 
-**Where it opens:** a `+`-menu launch always gets **its own window in the VR
-environment** (nested directly on Steam's compositor).
+- **Native Wayland window, no Steam app ID** (any `+`-menu app) - raw touch
+  is passed through. A nested KWin then sees finger touches, so clicks don't
+  register or release properly.
+- **Window with a Steam app ID** (from an `app-steam-app<ID>-*.scope` cgroup
+  or a Steam `reaper` parent) - real mouse clicks, but Steam treats the window
+  as a game and shows it in theater mode.
+- **X11 window on gamescope's Xwayland** (`DISPLAY=:0`) - gamescope enables
+  touch-pointer emulation for non-Steam X11 windows, so taps become ordinary
+  mouse clicks, with a visible cursor, in a normal window.
 
-**How clicks work there:** gamescope turns a VR-controller trigger pull into a
-touchscreen tap, then decides per window what to deliver. Native Wayland
-windows without a Steam app ID get raw touch (clicks that don't register or
-release properly); windows *with* an app ID get mouse clicks but Steam treats
-them as games (theater mode). Steam's own desktop avoids both: its KWin runs
-with the **X11 windowed backend** on gamescope's Xwayland (`DISPLAY=:0`), where
-gamescope enables touch-pointer emulation, so taps become ordinary mouse
-clicks with a cursor, in a normal window. The private desktop now does the
-same for `+`-menu launches.
+Steam's own desktop (`/usr/bin/steamos-nested-desktop`, the QAM's Desktop
+button) uses the third route: its KWin runs with the **X11 windowed backend**
+on `:0`. A `+`-menu launch of the private desktop does exactly the same:
+`DISPLAY=:0` (socket bound into the sandbox; gamescope's Xwayland needs no
+auth) and no `WAYLAND_DISPLAY`, so KWin picks its X11 backend. The parent
+Wayland socket is still bound for the clipboard bridge.
 
-Pass `--attach=desktop` to nest inside
-the Plasma desktop instead — it is started automatically if it isn't running
-(same command as the QAM button, logged to
+`--attach=desktop` nests inside the Plasma desktop instead; it is started
+automatically if it isn't running (same command as the QAM button, logged to
 `~/.local/share/frame-private-desktop/desktop-session.log`).
 
-When launched from the KDE application menu inside the Plasma desktop, the
-private desktop opens **fullscreen**, covering the regular desktop and taking
-all keyboard and mouse input until you quit it. Launched from the Frame's `+`
-menu it opens as a normal window. Fullscreen uses a temporary KWin window rule
-in `~/.config/kwinrulesrc`, which is removed again when the session ends.
-Pass `--windowed` to get a normal window from the KDE menu too.
+**Fullscreen from the KDE menu** uses a temporary KWin window rule in
+`~/.config/kwinrulesrc` matching the nested window's title ("KDE Wayland
+Compositor"; its window class is empty), with Force fullscreen. It is added
+after unlock, applied via the desktop KWin's `reconfigure`, and removed when
+the session ends; any rules you already have are preserved. `--windowed`
+opens a normal window instead.
 
 ## Requirements
 
@@ -162,6 +157,9 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
                               is Steam, so the bridge is usually pointless)
 --reset-empty-vault           Archive and reinitialize a vault that contains
                               nothing but its config (refuses if it has data)
+--attach auto|steam|desktop   '+'-menu target: own VR window (auto/steam, the
+                              default) or inside the Plasma desktop (desktop)
+--windowed                    From the KDE menu: normal window, not fullscreen
 ```
 
 ## Security model (read this)
@@ -210,13 +208,10 @@ nested KWin output; the Frame scales that image onto your virtual screen, so
   — read `~/.local/share/frame-private-desktop/launch.log`: every menu launch
   appends the controller's *and* the nested Plasma session's complete output
   plus the exit code.
-- **"WAYLAND_DISPLAY isn't set" from the `+` menu** — the `+` menu launches
-  Konsole from gamescope's outer session, which has no Wayland display; the
-  script auto-discovers a compositor socket under the user runtime and nests
-  on Steam's own gamescope socket, so it appears as its own window in the VR
-  environment (keyboard reliable, VR-controller clicks may stick;
-  `--attach=desktop` nests in the Plasma desktop instead). (Still
-  fails from a plain SSH shell, as it must.)
+- **"WAYLAND_DISPLAY isn't set" from the `+` menu** - expected: the `+` menu
+  launches Konsole from gamescope's session, which has only `DISPLAY=:0`. The
+  script runs the private KWin on that X11 display (see *Where it opens*).
+  (Still fails from a plain SSH shell, as it must.)
 - **Menu window flashes open and closes** — fixed: the script now prepends
   `~/.local/bin` to `PATH` itself (menu-launched Konsole inherits Plasma's
   minimal `PATH`, which hides `guix-env`). The window closes by itself when
